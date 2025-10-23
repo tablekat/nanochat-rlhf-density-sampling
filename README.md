@@ -1,4 +1,18 @@
-# nanochat
+# nanochat-rlhf-density-sampling
+
+Modern RL tends to result in mode collapse, or at least mode-seeking behavior. I theorize this could be a source of many issues with modern LLMs. For example, frequent patterns of speech ("not just x but y", em-dashes), difficulty following instructions, less creativity in writing or otherwise, regressions in grammar (for example, german text with english grammar), and a lack of ability to dynamically adjust personality to match a person's preferences on its own.
+
+I previously had thought this would come from a limitations of RMs, that they could only represent so much, but actually I think they're fairly powerful. Now I think it might be more like, an artifact of reverse-kl or something like that. For example, the loss manifold will tighten around the modes, reducing diversity. I think this has been something thought about more frequently lately:
+
+- https://arxiv.org/abs/2501.18101
+- https://arxiv.org/html/2509.04784v2
+- https://www.arxiv.org/abs/2510.14901
+
+^ These are all very interesting avenues, and they might be great but I had another idea. What if we take all the conversations we would otherwise sample when doing RLHF. Maybe this is pairwise (x, y_w, y_l) with winning/losing responses. Normally you would sample uniformly from "conversation space" to get a set of these to train on. What if, instead, we took a concrete conversation embedding, built a concrete conversation space, and then sampled these inversely proportional to the density, then continued with RLHF. Would this smooth the loss landscape? Would this result in less bad behavior as I described at the beginning?
+
+I'll need to think of actual evals to run. This is a TODO. Ideally I can compare to papers doing similar diversity focused RL. Were I to find similar behavior such as overuse of em-dashes, a first past eval might be to do compare the model RL'd with and without density sampling. I suppose I could just take token frequency and compare maybe. I should maybe also find a way to intentionally induce bad behavior in the training data and then see if this mitigates it.
+
+# Original readme!
 
 ![nanochat logo](dev/nanochat.png)
 
@@ -48,15 +62,15 @@ You can also `cat report.md` file which appeared in the project directory and co
 - Tokens (approx): 83,497
 - Dependencies (uv.lock lines): 2,004
 
-| Metric          | BASE     | MID      | SFT      | RL       |
-|-----------------|----------|----------|----------|----------|
-| CORE            | 0.2219   | -        | -        | -        |
-| ARC-Challenge   | -        | 0.2875   | 0.2807   | -        |
-| ARC-Easy        | -        | 0.3561   | 0.3876   | -        |
-| GSM8K           | -        | 0.0250   | 0.0455   | 0.0758   |
-| HumanEval       | -        | 0.0671   | 0.0854   | -        |
-| MMLU            | -        | 0.3111   | 0.3151   | -        |
-| ChatCORE        | -        | 0.0730   | 0.0884   | -        |
+| Metric        | BASE   | MID    | SFT    | RL     |
+| ------------- | ------ | ------ | ------ | ------ |
+| CORE          | 0.2219 | -      | -      | -      |
+| ARC-Challenge | -      | 0.2875 | 0.2807 | -      |
+| ARC-Easy      | -      | 0.3561 | 0.3876 | -      |
+| GSM8K         | -      | 0.0250 | 0.0455 | 0.0758 |
+| HumanEval     | -      | 0.0671 | 0.0854 | -      |
+| MMLU          | -      | 0.3111 | 0.3151 | -      |
+| ChatCORE      | -      | 0.0730 | 0.0884 | -      |
 
 Total wall clock time: 3h51m
 
