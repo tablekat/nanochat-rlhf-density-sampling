@@ -2,27 +2,45 @@
 
 This guide provides exact commands to download, process, and train models with GRPO (Generalized Reward Policy Optimization) using density-aware sampling for improved diversity and reduced mode collapse.
 
-## Quick Start (TL;DR)
+## ⚡ Quick Start: Automated Complete Pipeline
 
-If you want to run everything end-to-end:
+If you want to run **everything automatically** from scratch (including tokenizer, pretraining, SFT):
 
 ```bash
-# 1. Download all datasets
-python -m scripts.kat_download_pairs
+# Option 1: Simple (logs to console)
+bash kat_speedrun.sh
 
-# 2. Extract and deduplicate prompts
-python -m scripts.kat_make_prompts
+# Option 2: In a screen session (recommended, runs ~1-2 days)
+screen -L -Logfile kat_speedrun.log -S kat_speedrun bash kat_speedrun.sh
 
-# 3. Train reward model on SFT checkpoint
-torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm
-
-# 4. Train with GRPO (generalized reward policy optimization)
-torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
+# Option 3: With wandb logging
+WANDB_RUN=my_experiment bash kat_speedrun.sh
 ```
+
+**What it does** (all automatic):
+
+1. ✅ Setup Python environment
+2. ✅ Train tokenizer (if needed)
+3. ✅ Pretrain base model (depth=20)
+4. ✅ Mid-training
+5. ✅ Supervised fine-tuning (SFT)
+6. ✅ Download & deduplicate preference pairs
+7. ✅ Train reward model
+8. ✅ **GRPO with density sampling** (main experiment)
+9. ✅ **GRPO baseline** (uniform sampling)
+10. ✅ **Evaluate both** and generate report
+
+**Output**:
+
+- `outs/grpo_density/ckpt.pt` — Density-aware model
+- `outs/grpo_baseline/ckpt.pt` — Baseline model
+- `.cache/diversity_report.md` — Full evaluation report
+
+**Time estimate**: ~1-2 days on 8xH100 GPU node
 
 ---
 
-## Step-by-Step Guide
+## Manual Step-by-Step (if you already have SFT)
 
 ### Prerequisites
 
@@ -542,6 +560,83 @@ Approximate performance on 8xH100 GPU node:
 | Train GRPO (w/ density) | 4-8 hours     | Includes density computation      |
 | Train GRPO (baseline)   | 3-6 hours     | Faster, no density weighting      |
 | **Total**               | **~1-2 days** | Most time in RM and GRPO training |
+
+---
+
+## Automated Evaluation: Diversity Report
+
+After training both models, use the evaluation script to automatically test the hypothesis:
+
+```bash
+# Generate comprehensive diversity report
+python -m scripts.kat_eval_diversity \
+    --density_model_path outs/grpo_density/ckpt.pt \
+    --baseline_model_path outs/grpo_baseline/ckpt.pt \
+    --output_report .cache/diversity_report.md \
+    --num_prompts 100
+```
+
+### What the Report Measures
+
+The evaluation script analyzes:
+
+1. **Em-dash Frequency**
+
+   - Count of `—` and `–` characters
+   - Indicator of repetitive punctuation patterns (mode collapse)
+   - **Expected**: Density model has fewer em-dashes
+
+2. **Gini Coefficient** (token diversity)
+
+   - 0 = perfectly uniform distribution (ideal, all tokens equal)
+   - 1 = complete collapse (only one token used)
+   - **Expected**: Density model closer to 0 (more diverse)
+
+3. **Vocabulary Ratio**
+
+   - Unique tokens / total tokens
+   - **Expected**: Density model has higher ratio (more word variety)
+
+4. **Response Statistics**
+
+   - Sentence length, word count, character count
+   - **Expected**: Less repetition, more varied responses
+
+5. **Repetition Patterns**
+   - Counts phrases like "not just X but Y"
+   - **Expected**: Fewer in density model
+
+### Report Output
+
+The script generates a markdown report with:
+
+- ✅/❌ colored interpretation of each metric
+- Percentage improvement scores
+- Key findings and recommendations
+- Methodology explanation
+
+**Example output**:
+
+```
+✅ Em-dash Frequency: 45.2% reduction (GOOD)
+   - Density sampling reduces repetitive punctuation patterns
+
+✅ Gini Coefficient: 12.8% improvement (GOOD)
+   - Token distribution is more uniform/diverse with density sampling
+
+✅ Vocabulary Ratio: 8.5% improvement (GOOD)
+   - Model uses wider variety of words
+```
+
+### View the Report
+
+```bash
+# Display report
+cat .cache/diversity_report.md
+
+# Or open in editor
+nano .cache/diversity_report.md
+```
 
 ---
 

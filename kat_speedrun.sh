@@ -1,0 +1,207 @@
+#!/bin/bash
+
+# KAT Speedrun: Density-Aware GRPO with Hypothesis Testing
+# 
+# Complete pipeline testing mode collapse reduction via density-aware sampling.
+# This script trains two models:
+#   1. GRPO with density-aware sampling (main experiment)
+#   2. GRPO without density sampling (control/baseline)
+# Then evaluates both on diversity metrics.
+#
+# Expected runtime: ~1-2 days on 8xH100 GPU node at $3/GPU/hour
+#
+# Usage:
+#   bash kat_speedrun.sh
+#   WANDB_RUN=density_experiment bash kat_speedrun.sh
+#   screen -L -Logfile kat_speedrun.log -S kat_speedrun bash kat_speedrun.sh
+
+set -e  # Exit on error
+
+export OMP_NUM_THREADS=1
+export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+mkdir -p $NANOCHAT_BASE_DIR
+
+# wandb logging setup (optional)
+if [ -z "$WANDB_RUN" ]; then
+    WANDB_RUN=density_experiment
+fi
+
+echo "================================================================================"
+echo "KAT Speedrun: Density-Aware GRPO + Hypothesis Testing"
+echo "================================================================================"
+echo "Start time: $(date)"
+echo "WANDB_RUN: $WANDB_RUN"
+echo ""
+
+# =============================================================================
+# Python venv setup with uv
+echo "[1/6] Setting up Python environment..."
+command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+[ -d ".venv" ] || uv venv
+uv sync --extra gpu
+source .venv/bin/activate
+echo "✓ Environment ready"
+echo ""
+
+# =============================================================================
+# Stage 1: Train Tokenizer (if needed)
+if [ ! -f "$NANOCHAT_BASE_DIR/tok/ckpt.pt" ]; then
+    echo "[2/6] Training Tokenizer..."
+    
+    # Install Rust / Cargo
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "$HOME/.cargo/env"
+    
+    # Build rustbpe tokenizer
+    uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+    
+    # Download pretraining data
+    python -m nanochat.dataset -n 8
+    python -m nanochat.dataset -n 240 &
+    DATASET_DOWNLOAD_PID=$!
+    
+    # Train tokenizer
+    python -m scripts.tok_train --max_chars=2000000000
+    python -m scripts.tok_eval
+    
+    echo "Waiting for dataset download to complete..."
+    wait $DATASET_DOWNLOAD_PID
+    echo "✓ Tokenizer trained"
+else
+    echo "[2/6] Tokenizer already exists, skipping..."
+    echo ""
+fi
+
+# =============================================================================
+# Stage 2: Pretrain Base Model
+if [ ! -f "outs/base/ckpt.pt" ]; then
+    echo "[3/6] Pretraining base model (depth=20)..."
+    
+    # Download eval bundle if needed
+    if [ ! -d "$NANOCHAT_BASE_DIR/eval_bundle" ]; then
+        EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
+        curl -L -o eval_bundle.zip $EVAL_BUNDLE_URL
+        unzip -q eval_bundle.zip
+        rm eval_bundle.zip
+        mv eval_bundle $NANOCHAT_BASE_DIR
+    fi
+    
+    torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
+    torchrun --standalone --nproc_per_node=8 -m scripts.base_eval
+    echo "✓ Base model pretrained"
+else
+    echo "[3/6] Base model already exists, skipping..."
+fi
+echo ""
+
+# =============================================================================
+# Stage 3: Mid-training (conversation special tokens, etc.)
+if [ ! -f "outs/mid/ckpt.pt" ]; then
+    echo "[4/6] Mid-training..."
+    
+    # Download identity conversations
+    if [ ! -f "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" ]; then
+        curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+    fi
+    
+    torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i mid
+    echo "✓ Mid-training complete"
+else
+    echo "[4/6] Mid-training checkpoint already exists, skipping..."
+fi
+echo ""
+
+# =============================================================================
+# Stage 4: Supervised Fine-Tuning (SFT)
+if [ ! -f "outs/sft/ckpt.pt" ]; then
+    echo "[5/6] Supervised Fine-Tuning..."
+    torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+    echo "✓ SFT complete"
+else
+    echo "[5/6] SFT checkpoint already exists, skipping..."
+fi
+echo ""
+
+# =============================================================================
+# Stage 5: Pairwise Preference Data Pipeline
+echo "[6/6] Preparing pairwise preference data for GRPO..."
+
+echo "  [6a/6] Downloading preference pairs..."
+python -m scripts.kat_download_pairs --only hh  # Start with just HH for speed
+
+echo "  [6b/6] Deduplicating prompts..."
+python -m scripts.kat_make_prompts
+
+echo "  [6c/6] Training Reward Model..."
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --max_steps=1000
+
+echo "✓ Preference data pipeline complete"
+echo ""
+
+# =============================================================================
+# Stage 6: GRPO Training - Main Experiment (with density sampling)
+echo "================================================================"
+echo "MAIN EXPERIMENT: GRPO with Density-Aware Sampling"
+echo "================================================================"
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo \
+    --max_steps=5000 \
+    --learning_rate=1e-5 \
+    --beta=0.1 \
+    --density_aware=True \
+    --density_k=10 \
+    --out_dir outs/grpo_density
+
+echo "✓ GRPO with density sampling complete"
+echo ""
+
+# =============================================================================
+# Stage 7: GRPO Training - Baseline (without density sampling)
+echo "================================================================"
+echo "BASELINE: GRPO without Density Sampling (uniform sampling)"
+echo "================================================================"
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo \
+    --max_steps=5000 \
+    --learning_rate=1e-5 \
+    --beta=0.1 \
+    --density_aware=False \
+    --out_dir outs/grpo_baseline
+
+echo "✓ GRPO baseline complete"
+echo ""
+
+# =============================================================================
+# Stage 8: Evaluation - Diversity Metrics
+echo "================================================================"
+echo "EVALUATION: Testing Hypothesis"
+echo "================================================================"
+echo ""
+echo "Evaluating outputs for mode collapse indicators..."
+python -m scripts.kat_eval_diversity \
+    --density_model_path outs/grpo_density/ckpt.pt \
+    --baseline_model_path outs/grpo_baseline/ckpt.pt \
+    --output_report .cache/diversity_report.md
+
+echo ""
+echo "Report saved to: .cache/diversity_report.md"
+echo ""
+
+# =============================================================================
+# Final Summary
+echo "================================================================================"
+echo "KAT Speedrun Complete!"
+echo "End time: $(date)"
+echo "================================================================================"
+echo ""
+echo "Key outputs:"
+echo "  ✓ outs/grpo_density/ckpt.pt       (Main experiment)"
+echo "  ✓ outs/grpo_baseline/ckpt.pt      (Baseline)"
+echo "  ✓ .cache/diversity_report.md      (Evaluation results)"
+echo ""
+echo "Next steps:"
+echo "  1. Review .cache/diversity_report.md for hypothesis validation"
+echo "  2. Interactive chat: python -m scripts.chat_cli --ckpt_path outs/grpo_density/ckpt.pt"
+echo "  3. Web UI: python -m scripts.chat_web --ckpt_path outs/grpo_density/ckpt.pt"
+echo ""
