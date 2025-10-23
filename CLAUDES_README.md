@@ -1,22 +1,30 @@
-# Claude's Additions: Pairwise Preferences Data Pipeline
+# Claude's Additions: GRPO Training with Density-Aware Sampling
 
-This document describes the new data pipeline scripts added to support the density-sampling RLHF research in nanochat.
+This document describes the new training pipeline scripts for testing density-aware sampling in RLHF to reduce mode collapse.
 
-## Overview
+## Overview & Hypothesis
 
-The goal of this pipeline is to:
+**Main Hypothesis**: Modern RL in LLMs suffers from mode collapse (mode-seeking behavior), causing:
 
-1. Download open pairwise preference datasets from HuggingFace
-2. Consolidate them into a unified format
-3. Extract and deduplicate prompts
-4. Provide evaluation and analysis tools
-5. Prepare data for density-aware sampling during RLHF training
+- Overuse of em-dashes and repetitive patterns
+- Difficulty following instructions
+- Less creativity in writing
+- Grammar regressions (especially in non-English contexts)
+- Inability to dynamically adjust personality
 
-The theory is that by sampling conversation pairs inversely proportional to prompt density (rather than uniformly), we can improve the diversity of the model's outputs and reduce mode collapse.
+**Proposed Solution**: Instead of uniformly sampling from preference pairs during RLHF, sample **inversely proportional to prompt density**. This exposes the model to more diverse prompts, potentially smoothing the loss landscape and reducing mode collapse.
+
+**Key Components**:
+
+1. Download diverse pairwise preference data
+2. Deduplicate prompts and compute local density
+3. Train a reward model on preferences
+4. Train policy with GRPO using density-weighted sampling
+5. Compare outputs to baseline (uniform sampling)
 
 ## New Scripts
 
-All scripts follow the `kat_` naming convention (per your existing additions).
+All scripts follow the `kat_` naming convention.
 
 ### 1. `scripts/kat_download_pairs.py`
 
@@ -42,7 +50,7 @@ All scripts follow the `kat_` naming convention (per your existing additions).
 - Whitespace normalization for consistent processing
 - HTML stripping for Stack Exchange data
 - Duplicate detection by comparing prompts across datasets
-- Optional filtering by dataset (see Usage below)
+- Optional filtering by dataset
 
 **Usage**:
 
@@ -59,10 +67,9 @@ python -m scripts.kat_download_pairs --no-se
 python -m scripts.kat_download_pairs --only hh
 python -m scripts.kat_download_pairs --only uf
 python -m scripts.kat_download_pairs --only se
-
-# Custom output path
-python -m scripts.kat_download_pairs --out /path/to/pairs.jsonl
 ```
+
+---
 
 ### 2. `scripts/kat_make_prompts.py`
 
@@ -81,11 +88,12 @@ python -m scripts.kat_download_pairs --out /path/to/pairs.jsonl
   - Unique prompts found
   - Breakdown by source dataset
 
-**Why deduplication?**: The three datasets may have overlapping prompts. Deduplication helps:
+**Why deduplication?**:
 
-- Avoid training bias from redundant prompts
-- Prepare for density-based sampling (you only sample each unique prompt once)
-- Reduce storage requirements
+- The three datasets may have overlapping prompts
+- Deduplication avoids training bias from redundant prompts
+- Prepares for density-based sampling (each unique prompt sampled based on local density)
+- Reduces storage requirements
 
 **Usage**:
 
@@ -94,37 +102,163 @@ python -m scripts.kat_download_pairs --out /path/to/pairs.jsonl
 python -m scripts.kat_make_prompts
 ```
 
-### 3. `scripts/kat_eval_pairs.py`
+---
 
-**Purpose**: Analyze and evaluate the quality and characteristics of the consolidated pairs dataset.
+### 3. `scripts/kat_train_rm.py`
 
-**Analysis includes**:
+**Purpose**: Train a Reward Model (RM) on pairwise preferences.
 
-- **Basic statistics**: Total pairs, unique prompts, pair-to-prompt ratio
-- **Source distribution**: Breakdown of pairs by source dataset
-- **Length statistics**: Min, max, mean, median, p95 character counts for:
-  - Prompts
-  - Chosen responses
-  - Rejected responses
-- **Quality checks**:
-  - Empty prompts/responses
-  - Identical chosen/rejected responses
-  - Missing fields
+This script:
 
-**Output**: Formatted report printed to stdout and optionally saved to file
+1. Loads an SFT checkpoint (e.g., from `scripts.chat_sft`)
+2. Adds a scalar reward head (linear layer)
+3. Trains on preference pairs using Bradley-Terry loss
+4. Saves the trained RM checkpoint
+
+**Why RM first?**: The RM learns to score responses by predicting preferences. This enables GRPO to use a learned reward signal instead of hand-crafted ones.
+
+**Input Requirements**:
+
+- `.cache/data/pairs_all.jsonl` (from `kat_download_pairs.py`)
+- `outs/sft/ckpt.pt` (SFT checkpoint)
+
+**Output**: `outs/rm/ckpt.pt`
+
+- Contains trained reward head weights
+- Configuration saved for reconstruction
+
+**Loss Function**: Bradley-Terry preference loss
+
+```
+loss = -log(sigmoid(r_chosen - r_rejected))
+```
+
+This maximizes the probability that chosen response gets higher reward than rejected.
+
+**Key Hyperparameters**:
+
+- `--max_steps`: Number of training steps (default: 1000)
+- `--learning_rate`: RM head learning rate (default: 1e-4)
+- `--device_batch_size`: Batch size per device (default: 32)
 
 **Usage**:
 
 ```bash
-# Run evaluation on default paths
-python -m scripts.kat_eval_pairs
+# Train reward model
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm
 
-# Use custom input paths
-python -m scripts.kat_eval_pairs --pairs-file /path/to/pairs.jsonl --prompts-file /path/to/prompts.jsonl
+# Custom hyperparameters
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- \
+  --learning_rate=5e-4 \
+  --max_steps=2000 \
+  --device_batch_size=16
 
-# Save report to file
-python -m scripts.kat_eval_pairs --output-report .cache/data/eval_report.txt
+# Custom paths
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- \
+  --sft_ckpt_path outs/sft/ckpt.pt \
+  --pairs_path .cache/data/pairs_all.jsonl \
+  --out_path outs/rm/ckpt.pt
 ```
+
+**Typical Results**:
+
+- Training loss should decrease from ~0.7 to ~0.2-0.3
+- Training time: 2-4 hours on 8xH100 with full dataset
+
+---
+
+### 4. `scripts/kat_train_grpo.py`
+
+**Purpose**: Train policy with GRPO using density-aware sampling to reduce mode collapse.
+
+This script:
+
+1. Loads SFT checkpoint as the policy
+2. Loads trained RM checkpoint for reward scoring
+3. **Computes prompt embeddings and local density** (key innovation)
+4. **Samples preference pairs inversely proportional to density** (if enabled)
+5. Optimizes policy using GRPO loss with KL divergence penalty
+6. Tests hypothesis that diversity-aware sampling reduces mode collapse
+
+**Key Innovation - Density-Aware Sampling**:
+
+- Compute embeddings for each unique prompt
+- Estimate local prompt density using k-NN
+- Weight samples inversely: `weight = 1 / local_density`
+- High-density prompts (common): lower sampling weight
+- Low-density prompts (rare): higher sampling weight
+- **Result**: Model learns from diverse prompts, reducing mode collapse
+
+**Input Requirements**:
+
+- `outs/sft/ckpt.pt` (SFT checkpoint)
+- `outs/rm/ckpt.pt` (Trained RM checkpoint)
+- `.cache/data/pairs_all.jsonl` (preference pairs)
+- `.cache/data/prompts_all.jsonl` (unique prompts for density computation)
+
+**Output**: `outs/grpo/ckpt.pt`
+
+- Trained policy checkpoint
+- Config includes `density_aware` flag for reproducibility
+
+**Key Hyperparameters**:
+
+- `--max_steps`: Total training steps (default: 5000)
+- `--learning_rate`: Policy learning rate (default: 1e-5)
+- `--beta`: KL divergence penalty strength (default: 0.1)
+  - Higher beta = closer to SFT (less drift)
+  - Lower beta = more reward optimization
+- `--density_aware`: Enable/disable density weighting (default: True)
+- `--density_k`: k for k-NN density estimation (default: 10)
+
+**GRPO Loss Function**:
+
+```
+loss = -log(sigmoid(r_chosen - r_rejected)) + beta * KL(policy || reference)
+```
+
+- Preference term: maximize chosen reward vs rejected
+- KL term: don't diverge too much from SFT distribution
+
+**How KL Divergence Works**:
+
+1. SFT model is loaded twice: once as trainable policy, once as frozen reference
+2. Both policy and reference process same inputs (chosen/rejected responses)
+3. KL divergence computed: `KL(policy_logits || reference_logits)` for both responses
+4. Final KL loss is average of chosen and rejected KL values
+5. **Effect**: Prevents policy from drifting too far from SFT baseline while still optimizing for rewards
+
+**Usage**:
+
+```bash
+# Train with density-aware sampling (main experiment)
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
+
+# Train without density sampling (baseline for comparison)
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --density_aware=False
+
+# Adjust KL penalty
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --beta=0.05
+
+# Faster iteration (fewer steps)
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --max_steps=1000
+
+# Custom paths
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- \
+  --sft_ckpt_path outs/sft/ckpt.pt \
+  --rm_ckpt_path outs/rm/ckpt.pt \
+  --pairs_path .cache/data/pairs_all.jsonl \
+  --prompts_path .cache/data/prompts_all.jsonl \
+  --out_dir outs/grpo/
+```
+
+**Typical Results**:
+
+- Training loss should decrease gradually
+- Sampling weight distribution should show higher variance with density weighting
+- Training time: 4-8 hours on 8xH100
+
+---
 
 ## Data Flow
 
@@ -135,99 +269,175 @@ python -m scripts.kat_eval_pairs --output-report .cache/data/eval_report.txt
 [kat_download_pairs.py]
     |
     v
-.cache/data/pairs_all.jsonl
+.cache/data/pairs_all.jsonl  (276k pairs)
+    |
+    +---> [kat_make_prompts.py]
+    |           |
+    |           v
+    |     .cache/data/prompts_all.jsonl  (89k unique)
+    |
+    +---> [kat_train_rm.py]
+    |     (uses SFT checkpoint)
+    |           |
+    |           v
+    |     outs/rm/ckpt.pt  (Reward Model)
     |
     v
-[kat_make_prompts.py]
+[kat_train_grpo.py]
     |
-    +---> .cache/data/prompts_all.jsonl
+    +---> outs/grpo/ckpt.pt  (with density sampling)
     |
-    +---> .cache/data/prompt_id_map.tsv
-    |
-    +---> .cache/data/stats.txt
-    |
-    v
-[kat_eval_pairs.py]
-    |
-    v
-Evaluation Report
+    +---> outs/grpo_baseline/ckpt.pt  (uniform sampling)
 ```
+
+---
+
+## Experimental Design: Testing the Hypothesis
+
+To properly validate the hypothesis, you should:
+
+1. **Train with density sampling** (main experiment):
+
+   ```bash
+   torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
+   ```
+
+2. **Train without density sampling** (control):
+
+   ```bash
+   torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --density_aware=False
+   ```
+
+3. **Generate outputs** from both models and **compare**
+
+---
+
+## Evaluation: Measuring Mode Collapse Reduction
+
+After training both models, test the hypothesis by measuring:
+
+### Target Artifacts (should reduce with density sampling):
+
+- **Em-dash frequency**: Model uses em-dashes less often
+- **Repetitive patterns**: Less "not just X but Y" type constructions
+- **Grammar errors**: Fewer grammar mistakes in non-English contexts
+- **Token diversity**: Flatter token frequency distribution (higher Gini coefficient = more collapse)
+- **Personality consistency**: Better ability to vary tone based on context
+
+### Quick Evaluation Script
+
+```bash
+# Generate outputs from both models
+python -m scripts.chat_cli --ckpt_path outs/grpo/ckpt.pt > outputs_density.txt
+python -m scripts.chat_cli --ckpt_path outs/grpo_baseline/ckpt.pt > outputs_baseline.txt
+
+# Count em-dashes
+echo "Em-dashes (density):" && grep -o "—" outputs_density.txt | wc -l
+echo "Em-dashes (baseline):" && grep -o "—" outputs_baseline.txt | wc -l
+
+# Token frequency analysis (run the Gini script from CLAUDES_HOWTO.md)
+```
+
+---
 
 ## Storage Considerations
 
-The three datasets are **large**:
+The datasets are large:
 
 - HH-RLHF: ~160k pairs
 - UltraFeedback: ~64k pairs
 - Stack Exchange: ~52k pairs
+- **Total**: ~276k pairs (significantly reduced after deduplication)
 
-**Total**: ~276k pairs, but may be reduced significantly after deduplication.
+**File Sizes** (uncompressed):
 
-The JSONL files are gzippable if needed. Typical size:
+- `pairs_all.jsonl`: ~500 MB
+- `prompts_all.jsonl`: ~50 MB
+- `prompt_id_map.tsv`: ~50 MB
 
-- `pairs_all.jsonl`: ~500 MB (uncompressed)
-- `prompts_all.jsonl`: ~50 MB (uncompressed)
+**Optimization Tips**:
 
-If storage is an issue, you can:
+- Download only one dataset at a time if storage is limited
+- Use gzip compression if needed
+- Delete intermediate files after processing
 
-- Download only one dataset at a time: `python -m scripts.kat_download_pairs --only hh`
-- Keep only one of the output files (e.g., just `prompts_all.jsonl` for downstream use)
-- Compress with gzip after processing
-
-## Integration with Density Sampling
-
-These scripts prepare data for the density-aware RLHF approach mentioned in the main README. The next steps would be:
-
-1. **Compute prompt embeddings**: Convert each prompt to a fixed-dimensional embedding using a pretrained model (e.g., sentence-transformers)
-
-2. **Build embedding space**: Store embeddings in a database or cache for fast lookup
-
-3. **Estimate local density**: For each prompt, estimate the local density of prompts in embedding space (e.g., using k-NN)
-
-4. **Inverse density weighting**: When sampling during RLHF training, weight prompts inversely by their local density
-
-   - High-density prompts (common/similar to others): lower sampling weight
-   - Low-density prompts (rare/unique): higher sampling weight
-
-5. **RLHF with weighted sampling**: Use the density weights during preference learning to encourage diversity
+---
 
 ## Dependencies
 
 These scripts require:
 
-- `datasets` (HuggingFace datasets library)
+- `torch` & `torchvision`: PyTorch for deep learning
+- `datasets`: HuggingFace datasets library
+- `sklearn`: For k-NN density estimation
+- `tensorboard`: For training visualization
 - Standard library: `argparse`, `json`, `os`, `hashlib`, `re`, `collections`, `sys`, `pathlib`
 
-All should be available in the existing nanochat environment.
+All should be available in the nanochat environment.
+
+---
 
 ## Troubleshooting
 
-**Issue**: "HuggingFaceH4/ultrafeedback_binarized not found"
+### Problem: "SFT checkpoint not found"
 
-- **Cause**: Dataset may be temporarily unavailable or requires authentication
-- **Solution**: Try again later, or skip with `--no-uf` flag
+**Solution**: Run SFT training first:
 
-**Issue**: Out of memory during download
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
+```
 
-- **Cause**: Datasets are large and loaded into memory during processing
-- **Solution**: Download only one dataset at a time, or run on a machine with more RAM
+### Problem: Out of Memory
 
-**Issue**: Very few unique prompts after deduplication
+**Solution**:
 
-- **Cause**: The datasets have significant overlap
-- **Solution**: This is expected! It validates the need for proper deduplication in downstream processing
+1. Reduce batch size: `--device_batch_size=8`
+2. Download fewer datasets: `--no-uf --no-se`
+3. Use fewer training steps: `--max_steps=1000`
+
+### Problem: RM loss not decreasing
+
+**Debugging**:
+
+1. Check pairs data: `head -5 .cache/data/pairs_all.jsonl`
+2. Verify chosen/rejected are different
+3. Try higher learning rate: `--learning_rate=5e-4`
+
+### Problem: Slow GRPO training
+
+**Solutions**:
+
+- Disable density computation for initial testing: `--density_aware=False`
+- Reduce max_steps
+- Use smaller k: `--density_k=5`
+
+---
 
 ## Future Enhancements
 
-Potential improvements to this pipeline:
+Potential improvements:
 
-- Add semantic deduplication (beyond exact text matching) using embeddings
-- Implement filtering by response quality (e.g., remove very short responses)
-- Add source weighting to adjust the distribution of dataset contributions
-- Support incremental updates (append new pairs without reprocessing everything)
-- Add more datasets (e.g., OpenHermes, Orca, etc.)
+1. **Semantic embeddings**: Use sentence-transformers instead of hash-based embeddings
+2. **Adaptive density**: Recompute density periodically during training
+3. **Multiple RM heads**: Train separate RMs for different aspect (quality, diversity, helpfulness)
+4. **Curriculum learning**: Start with high-density prompts, gradually shift to low-density
+5. **Analysis tools**: Scripts to visualize prompt density distribution and sampling weights
+6. **Integration metrics**: Compare to papers on diversity-focused RL (cited in README)
+
+---
+
+## References & Related Work
+
+The hypothesis builds on recent work on mode collapse in RL:
+
+- https://arxiv.org/abs/2501.18101 (Diversity in RL)
+- https://arxiv.org/html/2509.04784v2 (Mode collapse analysis)
+- https://www.arxiv.org/abs/2510.14901 (RL diversity metrics)
+
+This implementation tests a specific mechanism: density-aware sampling.
 
 ---
 
 **Created**: October 2025  
-**Purpose**: Support density-aware RLHF research in nanochat
+**Focus**: Testing density-aware sampling to reduce mode collapse in LLM RLHF training  
+**Status**: Experimental - use for hypothesis validation, not production

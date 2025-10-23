@@ -1,6 +1,6 @@
-# How to Use the Pairwise Preferences Data Pipeline
+# How to Use the Pairwise Preferences Data Pipeline & GRPO Training
 
-This guide provides exact commands to download, process, and evaluate the pairwise preferences data for RLHF training with density-aware sampling.
+This guide provides exact commands to download, process, and train models with GRPO (Generalized Reward Policy Optimization) using density-aware sampling for improved diversity and reduced mode collapse.
 
 ## Quick Start (TL;DR)
 
@@ -13,8 +13,11 @@ python -m scripts.kat_download_pairs
 # 2. Extract and deduplicate prompts
 python -m scripts.kat_make_prompts
 
-# 3. Evaluate the dataset
-python -m scripts.kat_eval_pairs --output-report .cache/data/eval_report.txt
+# 3. Train reward model on SFT checkpoint
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm
+
+# 4. Train with GRPO (generalized reward policy optimization)
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
 ```
 
 ---
@@ -40,8 +43,9 @@ You should see output like:
 
 ```
 kat_download_pairs.py
-kat_eval_pairs.py
 kat_make_prompts.py
+kat_train_rm.py
+kat_train_grpo.py
 ```
 
 ---
@@ -168,86 +172,212 @@ src_ultrafeedback-binarized  64000
 src_stack-exchange-preferences  52543
 ```
 
-Look at a few prompts:
+---
+
+## Stage 3: Train Reward Model
+
+### 3.1 Train RM on SFT Checkpoint
+
+Before running GRPO, you need a trained reward model. This script trains an RM head on top of your SFT checkpoint to predict preference scores:
 
 ```bash
-head -5 .cache/data/prompts_all.jsonl
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm
+```
+
+**Expected behavior**:
+
+- Loads the SFT checkpoint (e.g., `outs/sft/ckpt.pt`)
+- Trains a scalar reward head using the pairs data
+- Saves RM checkpoint to `outs/rm/ckpt.pt`
+
+**Time estimate**: 2-4 hours on 8xH100
+
+**Key hyperparameters** (see `kat_train_rm.py`):
+
+- `--max_steps`: Number of training steps (default: reasonable default based on dataset size)
+- `--learning_rate`: Learning rate for RM training
+- `--batch_size_pairs`: How many pair comparisons per batch
+- `--device_batch_size`: Per-device batch size
+
+**Custom options**:
+
+```bash
+# Train with custom learning rate
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --learning_rate=1e-4
+
+# Train on fewer steps for testing
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --max_steps=100
+
+# Specify custom input/output paths
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- \
+  --sft_ckpt_path outs/sft/ckpt.pt \
+  --pairs_path .cache/data/pairs_all.jsonl \
+  --out_path outs/rm/ckpt.pt
 ```
 
 ---
 
-## Stage 3: Evaluate the Dataset
+## Stage 4: Train with GRPO
 
-### 3.1 Print Evaluation Report to Console
+### 4.1 Train with Density-Aware GRPO
+
+After training the reward model, train the policy with GRPO using density-aware sampling:
 
 ```bash
-python -m scripts.kat_eval_pairs
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
 ```
 
-This will print a formatted report with:
+**Expected behavior**:
 
-- Dataset size and composition
-- Source distribution
-- Response length statistics
-- Quality metrics
+- Loads the SFT checkpoint as policy
+- Loads the RM checkpoint for reward scoring
+- Samples preference pairs with density weighting (inversely proportional to prompt density)
+- Optimizes policy using GRPO loss
+- Saves checkpoints to `outs/grpo/`
+
+**Typical Results**:
+
+- Training loss should decrease gradually
+- Sampling weight distribution should show higher variance with density weighting
+- Training time: 4-8 hours on 8xH100
 
 ---
 
-### 3.2 Save Evaluation Report to File
+**Key hyperparameters**:
+
+- `--max_steps`: Total training steps
+- `--learning_rate`: Policy learning rate
+- `--beta`: KL divergence penalty (higher = closer to SFT)
+- `--density_aware`: Enable/disable density weighting (default: True)
+- `--density_k`: k-NN parameter for local density estimation
+
+**Custom options**:
 
 ```bash
-python -m scripts.kat_eval_pairs --output-report .cache/data/eval_report.txt
-```
+# Train without density weighting (baseline for comparison)
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --density_aware=False
 
-Then view it:
+# Adjust KL penalty strength
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --beta=0.1
 
-```bash
-cat .cache/data/eval_report.txt
+# Custom paths
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- \
+  --sft_ckpt_path outs/sft/ckpt.pt \
+  --rm_ckpt_path outs/rm/ckpt.pt \
+  --pairs_path .cache/data/pairs_all.jsonl \
+  --out_dir outs/grpo/
 ```
 
 ---
 
-### 3.3 Evaluate Custom Input Files
+## Evaluation: Diversity & Mode Collapse Metrics
 
-If you processed data with custom paths:
+### Key Hypothesis
+
+The goal is to test if density-aware sampling reduces mode collapse. Expected improvements:
+
+- ✅ **Reduced em-dash frequency**: Model uses em-dashes less often
+- ✅ **Better token diversity**: Token frequency distribution is flatter (less peaked)
+- ✅ **Improved grammar**: Grammar mistakes reduced (especially in non-English contexts)
+- ✅ **Better personality matching**: Model can adjust tone/style based on context
+- ✅ **More varied writing**: Less repetitive phrases and patterns
+
+### 4.1 Evaluate Diversity: Run Comparison
+
+After training both with (`--density_aware=True`) and without (`--density_aware=False`), evaluate:
 
 ```bash
-python -m scripts.kat_eval_pairs \
-  --pairs-file /path/to/pairs.jsonl \
-  --prompts-file /path/to/prompts.jsonl \
-  --output-report /path/to/report.txt
+# Generate outputs from both models
+python -m scripts.chat_cli --ckpt_path outs/grpo/ckpt.pt > outputs_grpo_density.txt
+python -m scripts.chat_cli --ckpt_path outs/grpo_baseline/ckpt.pt > outputs_grpo_baseline.txt
+```
+
+### 4.2 Analyze Em-Dash Frequency
+
+```bash
+# Count em-dashes in both outputs
+echo "GRPO with density sampling:" && grep -o "—" outputs_grpo_density.txt | wc -l
+echo "GRPO baseline:" && grep -o "—" outputs_grpo_baseline.txt | wc -l
+```
+
+### 4.3 Token Frequency Analysis
+
+Script to analyze vocabulary diversity (Gini coefficient):
+
+```bash
+python << 'EOF'
+import re
+from collections import Counter
+
+def gini_coefficient(tokens):
+    """Calculate Gini coefficient for token distribution (0=uniform, 1=all one token)"""
+    counts = Counter(tokens)
+    freqs = sorted(counts.values())
+    n = sum(freqs)
+    return sum((2 * i + 1) * f for i, f in enumerate(freqs)) / (n * len(freqs)) - (len(freqs) + 1) / len(freqs)
+
+def analyze_file(filename):
+    with open(filename, 'r') as f:
+        text = f.read().lower()
+
+    # Simple tokenization
+    tokens = re.findall(r'\b\w+\b', text)
+
+    gini = gini_coefficient(tokens)
+    print(f"{filename}: Gini coefficient = {gini:.4f}")
+    print(f"  (Lower = more diverse vocabulary)")
+    print(f"  Total tokens: {len(tokens)}")
+    print(f"  Unique tokens: {len(set(tokens))}")
+    print(f"  Diversity ratio: {len(set(tokens)) / len(tokens):.4f}")
+
+analyze_file('outputs_grpo_density.txt')
+analyze_file('outputs_grpo_baseline.txt')
+EOF
 ```
 
 ---
 
-## Verification Checklist
+## Understanding the Loss Breakdown
 
-After running all stages, verify everything succeeded:
+During GRPO training, you'll see logs like:
 
-```bash
-# Check that all output files exist
-ls -lh .cache/data/
-
-# Expected files:
-# pairs_all.jsonl          (should be ~500 MB)
-# prompts_all.jsonl        (should be ~50 MB)
-# prompt_id_map.tsv        (should be ~50 MB)
-# stats.txt                (should be a few KB)
-# eval_report.txt          (if you ran stage 3.2)
+```
+Step 100/5000 - Loss: 0.4532
+  Pref Loss: 0.3245, KL Loss: 0.1287, Total: 0.4532
 ```
 
-Count the number of pairs and prompts:
+**What each term means**:
+
+- **Pref Loss** (Preference Loss): Bradley-Terry loss on preference pairs
+  - Ideally decreases over time (model learns preferences)
+  - Range: typically 0.3-0.8
+- **KL Loss** (Kullback-Leibler Divergence): Divergence from SFT model
+  - Measures how far policy drifted from reference
+  - Higher KL = policy diverging more from SFT
+  - With `--beta=0.1`: KL should be ~1/3 of total loss
+- **Total Loss**: `pref_loss + beta * kl_loss`
+  - Should decrease gradually over training
+  - If stuck: adjust `--beta` (higher = stay closer to SFT)
+
+**Adjusting the balance**:
 
 ```bash
-echo "Pairs:" && wc -l .cache/data/pairs_all.jsonl && \
-echo "Prompts:" && wc -l .cache/data/prompts_all.jsonl
+# More reward optimization (less KL penalty)
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --beta=0.01
+
+# More conservative (higher KL penalty, closer to SFT)
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --beta=0.5
 ```
+
+---
+
+### 5.1 Baseline Comparison (Without Density)
 
 ---
 
 ## Full Pipeline: One Command
 
-If you want to run everything in sequence without stopping:
+If you want to run everything in sequence (warning: this takes ~1-2 days):
 
 ```bash
 echo "=== Stage 1: Download ===" && \
@@ -256,83 +386,118 @@ echo "" && \
 echo "=== Stage 2: Extract & Deduplicate ===" && \
 python -m scripts.kat_make_prompts && \
 echo "" && \
-echo "=== Stage 3: Evaluate ===" && \
-python -m scripts.kat_eval_pairs --output-report .cache/data/eval_report.txt && \
+echo "=== Stage 3: Train Reward Model ===" && \
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm && \
 echo "" && \
-echo "=== All Done! ===" && \
-ls -lh .cache/data/
+echo "=== Stage 4: Train GRPO (Density-Aware) ===" && \
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo && \
+echo "" && \
+echo "=== Stage 5: Train GRPO (Baseline) ===" && \
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --density_aware=False && \
+echo "" && \
+echo "=== All Done! ==="
 ```
 
-**Total time**: ~1-2 hours (mostly network I/O for downloads)
+**Total time**: ~1-2 days on 8xH100 GPU (mostly training)
 
 ---
 
-## What to Do With the Data
+## Output Artifacts
 
-Once you have the processed data, the next steps for density-aware RLHF would be:
+### RM Training Outputs
 
-### Option 1: Quick Integration (Not Yet Implemented)
+- `outs/rm/ckpt.pt`: Trained reward model checkpoint
+- `outs/rm/report.md`: Training report with loss curves
 
-- Use `prompts_all.jsonl` directly in existing RLHF training
-- Sampling would be uniform (no density weighting yet)
+### GRPO Training Outputs
 
-### Option 2: Density Sampling (Future Work)
-
-- Compute embeddings for each prompt using a sentence encoder
-- Build a k-NN graph to estimate local density
-- Weight samples inversely by density
-- Integrate into the RLHF training loop
-
-### Option 3: Exploratory Analysis
-
-- Use `eval_report.txt` to understand data characteristics
-- Analyze response quality by source dataset
-- Identify quality issues or biases
+- `outs/grpo/ckpt.pt`: Policy trained with density sampling
+- `outs/grpo/report.md`: Training report and diversity metrics
+- `outs/grpo_baseline/ckpt.pt` (if running baseline): Baseline without density sampling
+- `outs/grpo_baseline/report.md`: Baseline training report
 
 ---
 
 ## Troubleshooting
 
-### Problem: "No such file or directory" for pairs_all.jsonl
+### Problem: "SFT checkpoint not found"
 
-**Solution**: Stage 1 didn't complete or failed. Check:
+**Solution**: Make sure you've run SFT training first:
 
 ```bash
-python -m scripts.kat_download_pairs --only hh
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 ```
 
-Try downloading just one dataset first to debug network issues.
+### Problem: Out of Memory during RM training
 
-### Problem: Out of Memory
+**Solution**: Reduce batch size:
 
-**Solution**: Datasets are large. Try:
+```bash
+torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --device_batch_size=8
+```
 
-1. Download one dataset at a time (not all three)
-2. Run on a machine with more RAM
-3. Process smaller batches
+### Problem: RM not improving (loss stays flat)
 
-### Problem: Very Few Unique Prompts
+**Solution**:
 
-**Solution**: This is actually expected! Many datasets have overlapping questions. This validates that deduplication is important. Example realistic output:
+1. Check that pairs data is valid: `head -5 .cache/data/pairs_all.jsonl`
+2. Try higher learning rate: `--learning_rate=5e-4`
+3. Check RM architecture parameters
 
-- 276k pairs → 89k unique prompts (68% duplicate)
+### Problem: GRPO training very slow
 
-### Problem: Dataset Not Found
+**Solution**:
 
-**Solution**: HuggingFace datasets sometimes require authentication or may be temporarily unavailable.
+- Reduce `--max_steps` for testing
+- Decrease `--device_batch_size`
+- Disable density computation for initial testing: `--density_aware=False`
 
-- Try skipping that dataset: `python -m scripts.kat_download_pairs --no-uf`
-- Try again later
-- Check your HuggingFace token if needed: `huggingface-cli login`
+### Problem: Files not found
 
-### Problem: Script Import Errors
-
-**Solution**: Make sure you're running from repo root and environment is activated:
+**Solution**: Make sure you're in repo root and all stages completed:
 
 ```bash
 cd /path/to/nanochat-rlhf-density-sampling
-source .venv/bin/activate
+ls -la outs/sft/ckpt.pt
+ls -la .cache/data/pairs_all.jsonl
 ```
+
+---
+
+## Experimental Design: Testing the Hypothesis
+
+### Baseline Comparison
+
+To properly test the hypothesis, run both:
+
+1. **With density sampling** (main experiment):
+
+   ```bash
+   torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
+   ```
+
+2. **Without density sampling** (control):
+   ```bash
+   torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --density_aware=False
+   ```
+
+### Metrics to Track
+
+| Metric            | How to Measure                     | Expected Improvement |
+| ----------------- | ---------------------------------- | -------------------- |
+| Em-dash frequency | `grep -o "—" output.txt \| wc -l`  | 20-40% reduction     |
+| Token Gini coeff  | Gini script above                  | Lower = more diverse |
+| Vocab diversity   | Unique tokens / total              | 5-15% improvement    |
+| Grammar errors    | Manual review or language model    | 10-20% reduction     |
+| Task performance  | Benchmark scores (ARC, GSM8K, etc) | Should not degrade   |
+
+### Analysis Steps
+
+1. Generate N prompts from both models
+2. Measure frequency of target artifacts
+3. Compare token distributions
+4. Run standard benchmarks
+5. Compare diversity metrics
 
 ---
 
@@ -363,41 +528,20 @@ Each line is a JSON object:
 }
 ```
 
-### prompt_id_map.tsv
-
-Tab-separated values:
-
-```
-a1b2c3d4e5f6g7h8	What is the capital of France?
-b2c3d4e5f6g7h8i9	How do photosynthesis work?
-...
-```
-
-### stats.txt
-
-Key-value pairs:
-
-```
-total_pairs	276543
-unique_prompts	89234
-src_hh-rlhf	160000
-src_ultrafeedback-binarized	64000
-src_stack-exchange-preferences	52543
-```
-
 ---
 
 ## Performance Notes
 
-Approximate performance on a typical machine:
+Approximate performance on 8xH100 GPU node:
 
-| Stage          | Time          | Notes                                      |
-| -------------- | ------------- | ------------------------------------------ |
-| Download (all) | 20-40 min     | Network dependent, large dataset downloads |
-| Download (one) | 5-10 min      | Much faster if only doing one dataset      |
-| Deduplicate    | 2-5 min       | Processes ~276k items, mostly I/O          |
-| Evaluate       | <1 min        | Just reads files and computes stats        |
-| **Total**      | **1-2 hours** | Mostly waiting for downloads               |
+| Stage                   | Time          | Notes                             |
+| ----------------------- | ------------- | --------------------------------- |
+| Download (all)          | 20-40 min     | Network dependent                 |
+| Extract & deduplicate   | 2-5 min       | Deterministic prompt IDs          |
+| Train RM                | 2-4 hours     | On ~276k pairs                    |
+| Train GRPO (w/ density) | 4-8 hours     | Includes density computation      |
+| Train GRPO (baseline)   | 3-6 hours     | Faster, no density weighting      |
+| **Total**               | **~1-2 days** | Most time in RM and GRPO training |
 
 ---
 
@@ -405,18 +549,15 @@ Approximate performance on a typical machine:
 
 After completing this pipeline:
 
-1. **Understand your data**: Review `eval_report.txt` to understand distribution, quality, and characteristics
-
-2. **Plan density sampling**: Design how to compute embeddings and estimate density
-
-3. **Integrate with training**: Modify RLHF training loop to sample proportionally to `1/density`
-
-4. **Run experiments**: Train with and without density sampling to compare diversity metrics
-
-5. **Compare results**: Analyze if density sampling reduces mode collapse (em-dashes, repetitive patterns, etc.)
+1. **Compare models**: Generate outputs and analyze for mode collapse reduction
+2. **Measure diversity**: Use token frequency and artifact detection
+3. **Track performance**: Ensure quality metrics don't degrade
+4. **Iterate hyperparameters**: Adjust `--beta`, `--density_k`, etc.
+5. **Write results**: Document findings for hypothesis validation
 
 Good luck! 🚀
 
 ---
 
 **Last updated**: October 2025
+**Focus**: Density-aware GRPO for reducing mode collapse
