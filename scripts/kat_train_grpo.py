@@ -260,8 +260,21 @@ def main():
     parser.add_argument("--density_aware", type=lambda x: x.lower() in ['true', '1', 'yes'], 
                         default=True, help="Use density-aware sampling")
     parser.add_argument("--density_k", type=int, default=10, help="k for k-NN density estimation")
+    parser.add_argument("--use_precomputed_embeddings", action="store_true",
+                        help="Load pre-computed embeddings instead of computing online")
+    parser.add_argument("--embeddings_dir", default=None,
+                        help="Path to precomputed embeddings directory")
     parser.add_argument("--log_interval", type=int, default=100, help="Log interval")
     args = parser.parse_args()
+    
+    # Validate embeddings arguments
+    if args.use_precomputed_embeddings and args.embeddings_dir is None:
+        args.embeddings_dir = os.path.join(get_base_dir(), "data", "embeddings_offline")
+    
+    if args.use_precomputed_embeddings and not os.path.exists(args.embeddings_dir):
+        print(f"❌ Error: Embeddings directory not found: {args.embeddings_dir}")
+        print(f"   Run kat_compute_embeddings_offline.py first to generate embeddings")
+        sys.exit(1)
     
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -344,57 +357,83 @@ def main():
     # Compute density weights if enabled
     sampler = None
     if args.density_aware:
-        print(f"\nLoading base model for embeddings...")
-        try:
-            base_model, _, _ = load_model(
-                source="base",
-                device=device,
-                phase="eval"
-            )
-            base_model.eval()
-            print(f"✓ Base model loaded")
-        except Exception as e:
-            print(f"Warning: Could not load base model: {e}")
-            base_model = reference_model  # Fallback to SFT if base unavailable
+        # Try loading precomputed embeddings first
+        if args.use_precomputed_embeddings:
+            print(f"\nLoading pre-computed embeddings from {args.embeddings_dir}...")
+            try:
+                embeddings_path = os.path.join(args.embeddings_dir, "density_weights.npy")
+                weights = np.load(embeddings_path)
+                print(f"✓ Loaded pre-computed density weights ({len(weights)} prompts)")
+                
+                # Create sampler with precomputed weights
+                weights_tensor = torch.from_numpy(weights).float()
+                
+                # Repeat weights if dataset is different size
+                if len(weights_tensor) < len(dataset):
+                    repeat_factor = (len(dataset) // len(weights_tensor)) + 1
+                    weights_tensor = weights_tensor.repeat(repeat_factor)
+                    weights_tensor = weights_tensor[:len(dataset)]
+                
+                sampler = WeightedRandomSampler(weights_tensor, len(dataset), replacement=True)
+                print(f"✓ Density-aware sampler created from pre-computed weights")
+            except Exception as e:
+                print(f"❌ Error loading precomputed embeddings: {e}")
+                print(f"Falling back to online computation...")
+                args.use_precomputed_embeddings = False
         
-        try:
-            if not os.path.exists(args.prompts_path):
-                raise FileNotFoundError(f"Prompts file not found. Run kat_make_prompts first.")
+        # Fall back to online computation if not using precomputed
+        if not args.use_precomputed_embeddings:
+            print(f"\nLoading base model for online embedding computation...")
+            try:
+                base_model, _, _ = load_model(
+                    source="base",
+                    device=device,
+                    phase="eval"
+                )
+                base_model.eval()
+                print(f"✓ Base model loaded")
+            except Exception as e:
+                print(f"Warning: Could not load base model: {e}")
+                base_model = reference_model  # Fallback to SFT if base unavailable
             
-            prompts = []
-            with open(args.prompts_path, 'r') as f:
-                for line in f:
-                    try:
-                        prompt_obj = json.loads(line)
-                        prompts.append(prompt_obj['prompt'])
-                    except json.JSONDecodeError:
-                        continue
-            
-            if len(prompts) == 0:
-                raise RuntimeError("No valid prompts loaded")
-            
-            density_sampler = DensityAwareSampler(
-                prompts, 
-                base_model=base_model,
-                tokenizer=tokenizer,
-                device=device,
-                k=args.density_k
-            )
-            
-            # Create sampler with density weights
-            weights = torch.from_numpy(density_sampler.density_weights).float()
-            
-            # Repeat weights if dataset is different size
-            if len(weights) < len(dataset):
-                repeat_factor = (len(dataset) // len(weights)) + 1
-                weights = weights.repeat(repeat_factor)
-                weights = weights[:len(dataset)]
-            
-            sampler = WeightedRandomSampler(weights, len(dataset), replacement=True)
-            print(f"✓ Density-aware sampler created")
-        except Exception as e:
-            print(f"Warning: Could not create density sampler: {e}")
-            print(f"Falling back to uniform sampling")
+            try:
+                if not os.path.exists(args.prompts_path):
+                    raise FileNotFoundError(f"Prompts file not found. Run kat_make_prompts first.")
+                
+                prompts = []
+                with open(args.prompts_path, 'r') as f:
+                    for line in f:
+                        try:
+                            prompt_obj = json.loads(line)
+                            prompts.append(prompt_obj['prompt'])
+                        except json.JSONDecodeError:
+                            continue
+                
+                if len(prompts) == 0:
+                    raise RuntimeError("No valid prompts loaded")
+                
+                density_sampler = DensityAwareSampler(
+                    prompts, 
+                    base_model=base_model,
+                    tokenizer=tokenizer,
+                    device=device,
+                    k=args.density_k
+                )
+                
+                # Create sampler with density weights
+                weights = torch.from_numpy(density_sampler.density_weights).float()
+                
+                # Repeat weights if dataset is different size
+                if len(weights) < len(dataset):
+                    repeat_factor = (len(dataset) // len(weights)) + 1
+                    weights = weights.repeat(repeat_factor)
+                    weights = weights[:len(dataset)]
+                
+                sampler = WeightedRandomSampler(weights, len(dataset), replacement=True)
+                print(f"✓ Density-aware sampler created (online computation)")
+            except Exception as e:
+                print(f"Warning: Could not create density sampler: {e}")
+                print(f"Falling back to uniform sampling")
     
     # Create dataloader
     dataloader = DataLoader(
