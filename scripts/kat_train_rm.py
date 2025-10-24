@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
 """
-Train a Reward Model (RM) on pairwise preferences.
+Train a Reward Model (RM) on pairwise preferences with optional density-aware sampling.
 
 This script:
 1. Loads an SFT checkpoint via checkpoint_manager
 2. Adds a scalar reward head
 3. Trains on preference pairs (chosen vs rejected responses)
-4. Saves the trained RM
+4. Optionally weights pairs by inverse density to oversample rare prompts
+5. Saves the trained RM
 
 The RM learns to score responses by predicting preference (reward).
 This enables GRPO training to use a learned reward signal.
 
+Density-aware sampling helps the RM learn better representations for rare prompts.
+
 Usage:
   torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm
-  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --max_steps=500
-  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --learning_rate=5e-4
+  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --density_aware --max_steps=500
+  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --embeddings_dir ~/.cache/nanochat/data/embeddings_offline/
 """
 
 import argparse
 import json
+import hashlib
 import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from nanochat.checkpoint_manager import load_model, save_checkpoint, get_base_dir
@@ -147,6 +152,11 @@ def train_step(model, rm_head, batch, optimizer, device):
     return loss.item()
 
 
+def get_prompt_id(prompt: str) -> str:
+    """Get deterministic ID for a prompt (matching kat_make_prompts.py)."""
+    return hashlib.md5(prompt.encode("utf-8")).hexdigest()[:16]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Reward Model")
     
@@ -155,9 +165,14 @@ def main():
     parser.add_argument("--pairs_path", default=default_pairs, help="Path to pairs JSONL")
     parser.add_argument("--out_dir", default=os.path.join(get_base_dir(), "rm_checkpoints", "d20"), 
                         help="Output directory for RM checkpoint")
+    parser.add_argument("--embeddings_dir", default=os.path.join(get_base_dir(), "data", "embeddings_offline"),
+                        help="Path to embeddings directory with precomputed density weights")
     
     # Model source
     parser.add_argument("--sft_source", default="sft", help="Source to load SFT model from (sft|mid|base)")
+    
+    # Density sampling
+    parser.add_argument("--density_aware", action="store_true", help="Use density-aware sampling")
     
     # Training params
     parser.add_argument("--max_steps", type=int, default=1000, help="Maximum training steps")
@@ -210,10 +225,78 @@ def main():
         print(f"Error loading dataset: {e}")
         sys.exit(1)
     
+    # Create sampler (uniform or density-aware)
+    sampler = None
+    if args.density_aware:
+        print(f"\n{'='*70}")
+        print("Density-Aware Sampling Enabled")
+        print(f"{'='*70}")
+        
+        # Load precomputed density weights
+        try:
+            embeddings_path = os.path.join(args.embeddings_dir, "density_weights.npy")
+            
+            if not os.path.exists(embeddings_path):
+                raise FileNotFoundError(f"Density weights not found: {embeddings_path}")
+            
+            # Load weights
+            weights = np.load(embeddings_path)
+            
+            print(f"✓ Loaded density weights for {len(weights)} unique prompts")
+            
+            # Build mapping from prompts_all.jsonl: prompt_id → weight_index
+            prompts_path = os.path.join(get_base_dir(), "data", "prompts_all.jsonl")
+            if not os.path.exists(prompts_path):
+                raise FileNotFoundError(f"Prompts file not found: {prompts_path}")
+            
+            prompt_id_to_weight_idx = {}
+            with open(prompts_path, 'r') as f:
+                for weight_idx, line in enumerate(f):
+                    try:
+                        obj = json.loads(line)
+                        prompt_id_to_weight_idx[obj['id']] = weight_idx
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            
+            print(f"✓ Created prompt ID to weight index mapping ({len(prompt_id_to_weight_idx)} prompts)")
+            
+            # Map each pair to its prompt's density weight
+            pair_weights = np.ones(len(dataset), dtype=np.float32)
+            pairs_loaded = 0
+            with open(args.pairs_path, 'r') as f:
+                for pair_idx, line in enumerate(f):
+                    try:
+                        pair = json.loads(line)
+                        prompt_id = get_prompt_id(pair['prompt'])
+                        
+                        if prompt_id in prompt_id_to_weight_idx:
+                            weight_idx = prompt_id_to_weight_idx[prompt_id]
+                            if weight_idx < len(weights):
+                                pair_weights[pair_idx] = weights[weight_idx]
+                                pairs_loaded += 1
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            
+            print(f"✓ Assigned density weights to {pairs_loaded}/{len(dataset)} pairs")
+            print(f"  Min weight: {pair_weights.min():.6f}, Max weight: {pair_weights.max():.6f}")
+            
+            # Create weighted sampler
+            pair_weights_tensor = torch.from_numpy(pair_weights).float()
+            sampler = WeightedRandomSampler(pair_weights_tensor, len(dataset), replacement=True)
+            print(f"✓ Created WeightedRandomSampler")
+            
+        except Exception as e:
+            print(f"❌ Error setting up density sampling: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"Falling back to uniform sampling")
+            sampler = None
+    
     dataloader = DataLoader(
         dataset,
         batch_size=args.device_batch_size,
-        shuffle=True,
+        sampler=sampler,
+        shuffle=(sampler is None),  # Only shuffle if not using sampler
         num_workers=args.num_workers,
     )
     
@@ -228,7 +311,7 @@ def main():
     
     # Training loop
     print("\n" + "="*70)
-    print("Starting Reward Model Training")
+    print(f"Starting Reward Model Training ({args.out_dir})")
     print("="*70)
     
     rm_head.train()
@@ -267,6 +350,7 @@ def main():
         "hidden_size": hidden_size,
         "model_config": meta_data.get("model_config", {}),
         "training_steps": step,
+        "density_aware": args.density_aware,
     }
     
     # Save using checkpoint_manager pattern
@@ -274,6 +358,7 @@ def main():
         'rm_head_state_dict': model_state,
         'config': {
             'hidden_size': hidden_size,
+            'density_aware': args.density_aware,
         }
     }
     

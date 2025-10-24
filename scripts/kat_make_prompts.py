@@ -49,7 +49,6 @@ def main():
          open(IN_PATH, "r", encoding="utf-8") as fin:
 
         for line in fin:
-            total_pairs += 1
             try:
                 r = json.loads(line)
             except json.JSONDecodeError as e:
@@ -66,11 +65,13 @@ def main():
             by_src[s] += 1
             h = pid(p)
             if h in seen: 
+                total_pairs += 1
                 continue
             seen.add(h)
             uniq_prompts += 1
             fp.write(json.dumps({"id": h, "prompt": p}, ensure_ascii=False) + "\n")
             fm.write(f"{h}\t{p}\n")
+            total_pairs += 1
 
     # Validate output
     if total_pairs == 0:

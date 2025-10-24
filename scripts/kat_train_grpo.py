@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Train with GRPO (Generalized Reward Policy Optimization) using density-aware sampling.
+Train with GRPO (Generalized Reward Policy Optimization) with uniform sampling.
 
 This script:
 1. Loads SFT checkpoint as the policy via checkpoint_manager
-2. Loads trained RM checkpoint for reward scoring
-3. Computes prompt embeddings from base model's hidden states
-4. Samples preference pairs inversely proportional to density (if enabled)
-5. Optimizes policy using GRPO loss with KL divergence penalty
-6. Tests hypothesis that diversity-aware sampling reduces mode collapse
+2. Loads trained RM checkpoint for reward scoring (which may be density-aware)
+3. Samples preference pairs with UNIFORM sampling (no density weighting here)
+4. Optimizes policy using GRPO loss with KL divergence penalty
+5. Tests hypothesis that density-aware RM improves policy training
 
-The key innovation: instead of uniform sampling from preference pairs,
-we weight by 1/density to encourage the model to learn from diverse prompts.
+Key change: Density sampling now occurs during RM TRAINING, not GRPO.
+The policy trains on reward signals from a RM that has seen rare prompts more frequently.
+
+This allows us to compare:
+- Baseline RM (uniform sampling) -> GRPO (uniform sampling)
+- Density-aware RM -> GRPO (uniform sampling)
+- GRPO with density sampling (original approach, for comparison)
 
 Usage:
   torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
-  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --density_aware=False
-  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --beta=0.1 --max_steps=5000
+  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --rm_source rm --max_steps=5000
+  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --rm_source rm_density --beta=0.1
 """
 
 import argparse
@@ -239,7 +243,7 @@ def compute_grpo_loss(policy_logits, reference_logits, rm_rewards, beta=0.1, tem
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train with GRPO using density-aware sampling")
+    parser = argparse.ArgumentParser(description="Train with GRPO (Generalized Reward Policy Optimization)")
     
     # Paths
     default_pairs = os.path.join(get_base_dir(), "data", "pairs_all.jsonl")
@@ -249,7 +253,7 @@ def main():
     parser.add_argument("--pairs_path", default=default_pairs, help="Path to pairs")
     parser.add_argument("--prompts_path", default=default_prompts, help="Path to prompts")
     parser.add_argument("--sft_source", default="sft", help="Source for SFT model (sft|mid|base)")
-    parser.add_argument("--rm_source", default="rm", help="Source for RM model")
+    parser.add_argument("--rm_source", default="rm", help="Source for RM model (rm|rm_baseline|rm_density)")
     parser.add_argument("--out_dir", default=default_out, help="Output directory")
     
     # Training params
@@ -257,31 +261,15 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--beta", type=float, default=0.1, help="KL divergence penalty")
     parser.add_argument("--device_batch_size", type=int, default=8, help="Batch size per device")
-    parser.add_argument("--density_aware", type=lambda x: x.lower() in ['true', '1', 'yes'], 
-                        default=True, help="Use density-aware sampling")
-    parser.add_argument("--density_k", type=int, default=10, help="k for k-NN density estimation")
-    parser.add_argument("--use_precomputed_embeddings", action="store_true",
-                        help="Load pre-computed embeddings instead of computing online")
-    parser.add_argument("--embeddings_dir", default=None,
-                        help="Path to precomputed embeddings directory")
     parser.add_argument("--log_interval", type=int, default=100, help="Log interval")
     args = parser.parse_args()
-    
-    # Validate embeddings arguments
-    if args.use_precomputed_embeddings and args.embeddings_dir is None:
-        args.embeddings_dir = os.path.join(get_base_dir(), "data", "embeddings_offline")
-    
-    if args.use_precomputed_embeddings and not os.path.exists(args.embeddings_dir):
-        print(f"❌ Error: Embeddings directory not found: {args.embeddings_dir}")
-        print(f"   Run kat_compute_embeddings_offline.py first to generate embeddings")
-        sys.exit(1)
     
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
     
     print("="*70)
-    print(f"GRPO Training (density_aware={args.density_aware})")
+    print(f"GRPO Training (RM source: {args.rm_source})")
     print("="*70)
     
     # Load SFT checkpoint as policy
@@ -354,93 +342,17 @@ def main():
         print(f"Error loading dataset: {e}")
         sys.exit(1)
     
-    # Compute density weights if enabled
-    sampler = None
-    if args.density_aware:
-        # Try loading precomputed embeddings first
-        if args.use_precomputed_embeddings:
-            print(f"\nLoading pre-computed embeddings from {args.embeddings_dir}...")
-            try:
-                embeddings_path = os.path.join(args.embeddings_dir, "density_weights.npy")
-                weights = np.load(embeddings_path)
-                print(f"✓ Loaded pre-computed density weights ({len(weights)} prompts)")
-                
-                # Create sampler with precomputed weights
-                weights_tensor = torch.from_numpy(weights).float()
-                
-                # Repeat weights if dataset is different size
-                if len(weights_tensor) < len(dataset):
-                    repeat_factor = (len(dataset) // len(weights_tensor)) + 1
-                    weights_tensor = weights_tensor.repeat(repeat_factor)
-                    weights_tensor = weights_tensor[:len(dataset)]
-                
-                sampler = WeightedRandomSampler(weights_tensor, len(dataset), replacement=True)
-                print(f"✓ Density-aware sampler created from pre-computed weights")
-            except Exception as e:
-                print(f"❌ Error loading precomputed embeddings: {e}")
-                print(f"Falling back to online computation...")
-                args.use_precomputed_embeddings = False
-        
-        # Fall back to online computation if not using precomputed
-        if not args.use_precomputed_embeddings:
-            print(f"\nLoading base model for online embedding computation...")
-            try:
-                base_model, _, _ = load_model(
-                    source="base",
-                    device=device,
-                    phase="eval"
-                )
-                base_model.eval()
-                print(f"✓ Base model loaded")
-            except Exception as e:
-                print(f"Warning: Could not load base model: {e}")
-                base_model = reference_model  # Fallback to SFT if base unavailable
-            
-            try:
-                if not os.path.exists(args.prompts_path):
-                    raise FileNotFoundError(f"Prompts file not found. Run kat_make_prompts first.")
-                
-                prompts = []
-                with open(args.prompts_path, 'r') as f:
-                    for line in f:
-                        try:
-                            prompt_obj = json.loads(line)
-                            prompts.append(prompt_obj['prompt'])
-                        except json.JSONDecodeError:
-                            continue
-                
-                if len(prompts) == 0:
-                    raise RuntimeError("No valid prompts loaded")
-                
-                density_sampler = DensityAwareSampler(
-                    prompts, 
-                    base_model=base_model,
-                    tokenizer=tokenizer,
-                    device=device,
-                    k=args.density_k
-                )
-                
-                # Create sampler with density weights
-                weights = torch.from_numpy(density_sampler.density_weights).float()
-                
-                # Repeat weights if dataset is different size
-                if len(weights) < len(dataset):
-                    repeat_factor = (len(dataset) // len(weights)) + 1
-                    weights = weights.repeat(repeat_factor)
-                    weights = weights[:len(dataset)]
-                
-                sampler = WeightedRandomSampler(weights, len(dataset), replacement=True)
-                print(f"✓ Density-aware sampler created (online computation)")
-            except Exception as e:
-                print(f"Warning: Could not create density sampler: {e}")
-                print(f"Falling back to uniform sampling")
+    # Create dataloader with uniform sampling
+    # NOTE: Density sampling now happens during RM training, not GRPO
+    print(f"\n{'='*70}")
+    print("GRPO uses UNIFORM sampling")
+    print("(Density sampling moved to RM training stage)")
+    print(f"{'='*70}")
     
-    # Create dataloader
     dataloader = DataLoader(
         dataset,
         batch_size=args.device_batch_size,
-        sampler=sampler,
-        shuffle=(sampler is None),
+        shuffle=True,
     )
     
     # Setup optimization
@@ -520,7 +432,7 @@ def main():
     torch.save({
         'model_state_dict': policy.state_dict(),
         'config': {
-            'density_aware': args.density_aware,
+            'density_aware': False, # No longer density-aware
             'beta': args.beta,
             'training_steps': step,
         }
