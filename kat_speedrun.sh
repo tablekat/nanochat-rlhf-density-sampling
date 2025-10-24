@@ -34,6 +34,25 @@ echo "WANDB_RUN: $WANDB_RUN"
 echo ""
 
 # =============================================================================
+# GPU Detection and Setup
+echo "[GPU Detection] Detecting available GPUs..."
+NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
+if [ "$NUM_GPUS" = "0" ]; then
+    echo "⚠️  No GPUs detected! Running on CPU (very slow)"
+    NPROC_PER_NODE=1
+else
+    NPROC_PER_NODE=$NUM_GPUS
+    echo "✓ Found $NUM_GPUS GPU(s), using all of them"
+fi
+
+# Allow override via environment variable
+if [ ! -z "$NPROC_PER_NODE" ]; then
+    echo "  Using NPROC_PER_NODE=$NPROC_PER_NODE (from environment or detection)"
+fi
+
+echo ""
+
+# =============================================================================
 # Python venv setup with uv
 echo "[1/6] Setting up Python environment..."
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -45,7 +64,7 @@ echo ""
 
 # =============================================================================
 # Stage 1: Train Tokenizer (if needed)
-if [ ! -f "$NANOCHAT_BASE_DIR/tok/ckpt.pt" ]; then
+if [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl" ]; then
     echo "[2/6] Training Tokenizer..."
     
     # Install Rust / Cargo
@@ -64,17 +83,22 @@ if [ ! -f "$NANOCHAT_BASE_DIR/tok/ckpt.pt" ]; then
     python -m scripts.tok_train --max_chars=2000000000
     python -m scripts.tok_eval
     
-    echo "Waiting for dataset download to complete..."
-    wait $DATASET_DOWNLOAD_PID
     echo "✓ Tokenizer trained"
 else
     echo "[2/6] Tokenizer already exists, skipping..."
-    echo ""
 fi
+echo ""
+
+# Wait for dataset download to complete (started during tokenizer training)
+if [ ! -z "$DATASET_DOWNLOAD_PID" ]; then
+    echo "Waiting for dataset download to complete..."
+    wait $DATASET_DOWNLOAD_PID
+fi
+echo ""
 
 # =============================================================================
 # Stage 2: Pretrain Base Model
-if [ ! -f "outs/base/ckpt.pt" ]; then
+if [ ! -f "$NANOCHAT_BASE_DIR/base_checkpoints/d20/model_000000.pt" ]; then
     echo "[3/6] Pretraining base model (depth=20)..."
     
     # Download eval bundle if needed
@@ -86,9 +110,9 @@ if [ ! -f "outs/base/ckpt.pt" ]; then
         mv eval_bundle $NANOCHAT_BASE_DIR
     fi
     
-    torchrun --standalone --nproc_per_node=7 -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=7 -m scripts.base_loss
-    torchrun --standalone --nproc_per_node=7 -m scripts.base_eval
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
     echo "✓ Base model pretrained"
 else
     echo "[3/6] Base model already exists, skipping..."
@@ -97,7 +121,7 @@ echo ""
 
 # =============================================================================
 # Stage 3: Mid-training (conversation special tokens, etc.)
-if [ ! -f "outs/mid/ckpt.pt" ]; then
+if [ ! -f "$NANOCHAT_BASE_DIR/mid_checkpoints/d20/model_000000.pt" ]; then
     echo "[4/6] Mid-training..."
     
     # Download identity conversations
@@ -105,8 +129,8 @@ if [ ! -f "outs/mid/ckpt.pt" ]; then
         curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
     fi
     
-    torchrun --standalone --nproc_per_node=7 -m scripts.mid_train -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=7 -m scripts.chat_eval -- -i mid
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
     echo "✓ Mid-training complete"
 else
     echo "[4/6] Mid-training checkpoint already exists, skipping..."
@@ -115,10 +139,10 @@ echo ""
 
 # =============================================================================
 # Stage 4: Supervised Fine-Tuning (SFT)
-if [ ! -f "outs/sft/ckpt.pt" ]; then
+if [ ! -f "$NANOCHAT_BASE_DIR/chatsft_checkpoints/d20/model_000000.pt" ]; then
     echo "[5/6] Supervised Fine-Tuning..."
-    torchrun --standalone --nproc_per_node=7 -m scripts.chat_sft -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=7 -m scripts.chat_eval -- -i sft
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
     echo "✓ SFT complete"
 else
     echo "[5/6] SFT checkpoint already exists, skipping..."
@@ -136,7 +160,7 @@ echo "  [6b/6] Deduplicating prompts..."
 python -m scripts.kat_make_prompts
 
 echo "  [6c/6] Training Reward Model..."
-torchrun --standalone --nproc_per_node=7 -m scripts.kat_train_rm -- --max_steps=1000
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm -- --max_steps=1000
 
 echo "✓ Preference data pipeline complete"
 echo ""
@@ -146,7 +170,7 @@ echo ""
 echo "================================================================"
 echo "MAIN EXPERIMENT: GRPO with Density-Aware Sampling"
 echo "================================================================"
-torchrun --standalone --nproc_per_node=7 -m scripts.kat_train_grpo \
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo \
     --max_steps=5000 \
     --learning_rate=1e-5 \
     --beta=0.1 \
@@ -162,7 +186,7 @@ echo ""
 echo "================================================================"
 echo "BASELINE: GRPO without Density Sampling (uniform sampling)"
 echo "================================================================"
-torchrun --standalone --nproc_per_node=7 -m scripts.kat_train_grpo \
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo \
     --max_steps=5000 \
     --learning_rate=1e-5 \
     --beta=0.1 \

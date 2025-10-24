@@ -38,7 +38,8 @@ python -c "from fastapi import FastAPI; print('✓ fastapi')"
 
 # (optional) run speedrun to produce out/ckpt.pt + tokenizer.model
 screen -S speedrun
-bash speedrun.sh
+source .venv/bin/activate
+bash kat_speedrun.sh
 # detach: Ctrl-A then D; reattach: screen -r speedrun
 ```
 

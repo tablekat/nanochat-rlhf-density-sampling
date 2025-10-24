@@ -12,6 +12,36 @@ I previously had thought this would come from a limitations of RMs, that they co
 
 I'll need to think of actual evals to run. This is a TODO. Ideally I can compare to papers doing similar diversity focused RL. Were I to find similar behavior such as overuse of em-dashes, a first past eval might be to do compare the model RL'd with and without density sampling. I suppose I could just take token frequency and compare maybe. I should maybe also find a way to intentionally induce bad behavior in the training data and then see if this mitigates it.
 
+```
+sudo apt-get update -y && sudo apt-get install -y git python3-venv screen
+git clone https://github.com/tablekat/nanochat-rlhf-density-sampling.git
+cd nanochat
+python3 -m venv .venv && source .venv/bin/activate
+
+pip install --upgrade pip setuptools wheel && \
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && \
+pip install datasets ujson tqdm nltk numpy scipy scikit-learn && \
+pip install sentence-transformers umap-learn && \
+pip install fastapi uvicorn pydantic tensorboard regex python-multipart && \
+pip install transformers huggingface-hub
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+python -c "from sentence_transformers import SentenceTransformer; print('✓ sentence-transformers')"
+python -c "import umap; print('✓ umap')"
+python -c "from fastapi import FastAPI; print('✓ fastapi')"
+# RunPod usually has CUDA 11.8/12.0. If the cu118 torch install fails, try:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+
+# (optional) run speedrun to produce out/ckpt.pt + tokenizer.model
+screen -S speedrun
+source .venv/bin/activate
+export NPROC=7
+export WORLD_SIZE=7
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 bash kat_speedrun.sh # 7 because runpod had 7 because lambda.ai didn't accept my credit card.
+
+# detach: Ctrl-A then D; reattach: screen -r speedrun
+```
+
 # Original readme!
 
 ![nanochat logo](dev/nanochat.png)
