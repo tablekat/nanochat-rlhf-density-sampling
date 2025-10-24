@@ -36,25 +36,56 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 
+from nanochat.checkpoint_manager import load_model, get_base_dir
+from nanochat.tokenizer import get_tokenizer
 
-def load_model(model_path):
-    """Load a model checkpoint."""
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found: {model_path}")
+
+def generate_samples(model_source, num_samples=50, prompts=None, device="cpu"):
+    """Generate text samples from a model using checkpoint_manager."""
+    if prompts is None:
+        prompts = [
+            "Explain quantum computing",
+            "What is machine learning?",
+            "How does photosynthesis work?",
+            "What is the meaning of life?",
+            "How do neural networks work?",
+        ]
     
-    checkpoint = torch.load(model_path, map_location="cpu")
-    return checkpoint
-
-
-def generate_samples(model_path, num_samples=50, prompts=None):
-    """Generate text samples from a model."""
     try:
-        checkpoint = load_model(model_path)
-        # Simplified - in practice would use actual generation
-        # For now, return placeholder samples
-        return [f"Sample {i}" for i in range(num_samples)]
+        print(f"Loading model from {model_source}...")
+        model, tokenizer, _ = load_model(model_source, device=device, phase="eval")
+        model.eval()
+        print(f"✓ Model loaded successfully")
+        
+        samples = []
+        with torch.no_grad():
+            for i, prompt in enumerate(prompts[:num_samples]):
+                # Encode prompt
+                prompt_ids = tokenizer.encode(prompt)
+                
+                # Generate text using model's generate method
+                generated_ids = list(model.generate(
+                    prompt_ids,
+                    max_tokens=100,
+                    temperature=0.8,
+                    top_k=50,
+                    seed=42 + i
+                ))
+                
+                # Decode to text
+                full_ids = prompt_ids + generated_ids
+                generated_text = tokenizer.decode(full_ids)
+                samples.append(generated_text)
+                
+                if (i + 1) % 10 == 0:
+                    print(f"  Generated {i + 1}/{num_samples} samples")
+        
+        return samples
+        
     except Exception as e:
-        print(f"Warning: Could not generate samples: {e}")
+        print(f"Error generating samples: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
@@ -299,11 +330,15 @@ def generate_report(improvements, output_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate diversity and mode collapse")
-    parser.add_argument("--density_model_path", default="outs/grpo_density/ckpt.pt",
-                        help="Path to density-aware GRPO model")
-    parser.add_argument("--baseline_model_path", default="outs/grpo_baseline/ckpt.pt",
-                        help="Path to baseline GRPO model")
-    parser.add_argument("--output_report", default=".cache/diversity_report.md",
+    
+    # Use get_base_dir() for default paths
+    base_dir = get_base_dir()
+    
+    parser.add_argument("--density_model_source", default="grpo",
+                        help="Model source for density-aware model (grpo|sft|base)")
+    parser.add_argument("--baseline_model_source", default="sft",
+                        help="Model source for baseline model (grpo|sft|base)")
+    parser.add_argument("--output_report", default=os.path.join(base_dir, "diversity_report.md"),
                         help="Output report path")
     parser.add_argument("--num_prompts", type=int, default=50,
                         help="Number of samples to generate from each model")
@@ -314,51 +349,27 @@ def main():
     print("=" * 70)
     print("")
     
-    # For now, generate mock samples to demonstrate the framework
-    # In practice, would use actual generation
-    print("Generating samples...")
-    density_samples = generate_samples(args.density_model_path, args.num_prompts)
-    baseline_samples = generate_samples(args.baseline_model_path, args.num_prompts)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    # Generate real samples from both models
+    print(f"Generating samples from density-aware model ({args.density_model_source})...")
+    density_samples = generate_samples(args.density_model_source, args.num_prompts, device=device)
+    
+    print(f"\nGenerating samples from baseline model ({args.baseline_model_source})...")
+    baseline_samples = generate_samples(args.baseline_model_source, args.num_prompts, device=device)
+    
+    # Validate that we got real samples
     if not density_samples or not baseline_samples:
-        print("Error: Could not generate samples from models")
-        print("Creating demonstration report with mock data...")
-        
-        # Create mock samples for demonstration
-        mock_prompts = [
-            "Explain quantum computing",
-            "How does photosynthesis work?",
-            "What is machine learning?",
-        ]
-        
-        # Mock density samples (more diverse)
-        density_samples = [
-            "Quantum computing uses qubits. These quantum bits can exist in superposition. "
-            "The potential applications are vast—spanning cryptography, optimization, and simulation.",
-            "Photosynthesis occurs in plants. It transforms sunlight into chemical energy. "
-            "This process involves chlorophyll and produces oxygen as a byproduct.",
-            "Machine learning is a subset of AI. It enables computers to learn from data. "
-            "Various techniques—neural networks, decision trees, and support vectors—accomplish this.",
-        ] * (args.num_prompts // 3 + 1)
-        
-        # Mock baseline samples (repetitive with em-dashes)
-        baseline_samples = [
-            "Quantum computing—not just computing but quantum computing—uses qubits. "
-            "The applications are vast—not just vast but incredibly vast—spanning many fields. "
-            "It's a fascinating field—not just fascinating but revolutionary.",
-            "Photosynthesis—not just a process but a vital process—occurs in plants. "
-            "Plants convert sunlight—not just sunlight but solar energy—into chemical energy. "
-            "This is important—not just important but critical—for life on Earth.",
-            "Machine learning—not just learning but machine learning—is fascinating. "
-            "It involves neural networks—not just networks but deep networks—and algorithms. "
-            "The field is growing—not just growing but exploding—rapidly.",
-        ] * (args.num_prompts // 3 + 1)
+        print("\n⚠️  Warning: Could not generate real samples from models")
+        print("Ensure models have been trained with:")
+        print(f"  - torchrun -m scripts.kat_train_rm")
+        print(f"  - torchrun -m scripts.kat_train_grpo")
+        print("\nAlternatively, you can run with mock data for demonstration:")
+        print(f"  python -m scripts.kat_eval_diversity --use_mock_data")
+        sys.exit(1)
     
-    density_samples = density_samples[:args.num_prompts]
-    baseline_samples = baseline_samples[:args.num_prompts]
-    
-    print(f"Analyzing {len(density_samples)} density samples...")
-    print(f"Analyzing {len(baseline_samples)} baseline samples...")
+    print(f"✓ Generated {len(density_samples)} density-aware samples")
+    print(f"✓ Generated {len(baseline_samples)} baseline samples")
     print("")
     
     # Compare models

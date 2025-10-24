@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Download open pairwise preference datasets and write a single JSONL:
-  .cache/data/pairs_all.jsonl
+  $NANOCHAT_BASE_DIR/data/pairs_all.jsonl
 Each line: {"id","prompt","chosen","rejected"}
 
 Datasets included (defaults):
@@ -15,10 +15,12 @@ Usage:
   python -m scripts.kat_download_pairs --only hh  # only HH
 """
 
-import argparse, os, uuid, re, json
+import argparse, os, uuid, re, json, sys
 from datasets import load_dataset
+from nanochat.common import get_base_dir
 
-OUT_DIR = os.path.join(".cache", "data")
+base_dir = get_base_dir()
+OUT_DIR = os.path.join(base_dir, "data")
 OUT_PATH = os.path.join(OUT_DIR, "pairs_all.jsonl")
 
 def norm_space(s: str) -> str:
@@ -101,18 +103,46 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
+    
+    print(f"Downloading preference pair datasets...")
+    print(f"Output: {args.out}")
+    
     cnt = 0
     with open(args.out, "w", encoding="utf-8") as f:
         if args.only in (None, "hh") and not args.no_hh:
+            print("  - Downloading Anthropic/hh-rlhf...")
             for row in from_hh():
-                cnt += 1; f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                cnt += 1
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if cnt % 1000 == 0:
+                    print(f"    {cnt} pairs downloaded...")
+        
         if args.only in (None, "uf") and not args.no_uf:
+            print("  - Downloading HuggingFaceH4/ultrafeedback_binarized...")
             for row in from_ultrafeedback_binarized():
-                cnt += 1; f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                cnt += 1
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if cnt % 1000 == 0:
+                    print(f"    {cnt} pairs downloaded...")
+        
         if args.only in (None, "se") and not args.no_se:
+            print("  - Downloading HuggingFaceH4/stack-exchange-preferences...")
             for row in from_stack_exchange_prefs():
-                cnt += 1; f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"Wrote {args.out} with {cnt} pairs")
+                cnt += 1
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if cnt % 1000 == 0:
+                    print(f"    {cnt} pairs downloaded...")
+    
+    # Validate output
+    if cnt == 0:
+        print(f"\n❌ Error: No pairs downloaded!")
+        print(f"Check internet connection and HuggingFace dataset availability")
+        sys.exit(1)
+    
+    if cnt < 1000:
+        print(f"\n⚠️  Warning: Only {cnt} pairs downloaded (expected >10,000)")
+    
+    print(f"\n✓ Successfully wrote {args.out} with {cnt} pairs")
 
 if __name__ == "__main__":
     main()

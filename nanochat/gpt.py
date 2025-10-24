@@ -241,7 +241,7 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_hidden_states=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
@@ -259,6 +259,9 @@ class GPT(nn.Module):
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
+        # Store hidden states before applying lm_head
+        hidden_states = x
+
         # Forward the lm_head (compute logits)
         softcap = 15
         if targets is not None:
@@ -273,6 +276,13 @@ class GPT(nn.Module):
             # inference mode: compute and return the logits
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap) # logits softcap
+            
+            # Return hidden states if requested (for embeddings/probing)
+            if return_hidden_states:
+                return {
+                    'logits': logits,
+                    'hidden_states': hidden_states,
+                }
             return logits
 
     @torch.inference_mode()

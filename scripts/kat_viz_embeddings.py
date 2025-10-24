@@ -30,6 +30,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from nanochat.common import get_base_dir
+
 
 def load_pairs(path):
     """Load preference pairs from JSONL."""
@@ -174,9 +176,15 @@ def create_visualization_data(pairs, embeddings_3d, local_density):
 
 def main():
     parser = argparse.ArgumentParser(description="Compute embeddings and project to 3D")
-    parser.add_argument("--pairs_path", default=".cache/data/pairs_all.jsonl",
+    
+    # Use get_base_dir() for default paths
+    base_dir = get_base_dir()
+    default_pairs = os.path.join(base_dir, "data", "pairs_all.jsonl")
+    default_output = os.path.join(base_dir, "embeddings_3d.json")
+    
+    parser.add_argument("--pairs_path", default=default_pairs,
                         help="Path to pairs JSONL")
-    parser.add_argument("--output_path", default=".cache/embeddings_3d.json",
+    parser.add_argument("--output_path", default=default_output,
                         help="Output JSON path")
     parser.add_argument("--model_name", default="sentence-transformers/all-MiniLM-L6-v2",
                         help="Embedding model name")
