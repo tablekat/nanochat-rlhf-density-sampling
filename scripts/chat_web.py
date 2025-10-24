@@ -259,6 +259,26 @@ async def logo():
     logo_path = os.path.join("nanochat", "logo.svg")
     return FileResponse(logo_path, media_type="image/svg+xml")
 
+@app.get("/viz")
+async def embedding_viz():
+    """Serve the 3D embedding space visualization."""
+    ui_3d_path = os.path.join("nanochat", "ui_3d.html")
+    if not os.path.exists(ui_3d_path):
+        raise HTTPException(status_code=404, detail="3D visualization not found. Run: python -m scripts.kat_viz_embeddings")
+    with open(ui_3d_path, "r") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content)
+
+@app.get("/api/embeddings_3d")
+async def embeddings_3d():
+    """Serve 3D embedding data for visualization."""
+    embeddings_path = os.path.join(".cache", "embeddings_3d.json")
+    if not os.path.exists(embeddings_path):
+        raise HTTPException(status_code=404, detail="Embedding data not found. Run: python -m scripts.kat_viz_embeddings")
+    with open(embeddings_path, "r") as f:
+        data = json.load(f)
+    return data
+
 async def generate_stream(
     worker: Worker,
     tokens,
