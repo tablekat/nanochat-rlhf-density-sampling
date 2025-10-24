@@ -15,6 +15,31 @@ screen -L -Logfile kat_speedrun.log -S kat_speedrun bash kat_speedrun.sh
 
 # Option 3: With wandb logging
 WANDB_RUN=my_experiment bash kat_speedrun.sh
+
+# ----
+sudo apt-get update -y && sudo apt-get install -y git python3-venv screen
+git clone https://github.com/tablekat/nanochat-rlhf-density-sampling.git
+cd nanochat
+python3 -m venv .venv && source .venv/bin/activate
+
+pip install --upgrade pip setuptools wheel && \
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && \
+pip install datasets ujson tqdm nltk numpy scipy scikit-learn && \
+pip install sentence-transformers umap-learn && \
+pip install fastapi uvicorn pydantic tensorboard regex python-multipart && \
+pip install transformers huggingface-hub
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+python -c "from sentence_transformers import SentenceTransformer; print('✓ sentence-transformers')"
+python -c "import umap; print('✓ umap')"
+python -c "from fastapi import FastAPI; print('✓ fastapi')"
+# RunPod usually has CUDA 11.8/12.0. If the cu118 torch install fails, try:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+
+# (optional) run speedrun to produce out/ckpt.pt + tokenizer.model
+screen -S speedrun
+bash speedrun.sh
+# detach: Ctrl-A then D; reattach: screen -r speedrun
 ```
 
 **What it does** (all automatic):

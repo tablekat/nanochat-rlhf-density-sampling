@@ -86,9 +86,9 @@ if [ ! -f "outs/base/ckpt.pt" ]; then
         mv eval_bundle $NANOCHAT_BASE_DIR
     fi
     
-    torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
-    torchrun --standalone --nproc_per_node=8 -m scripts.base_eval
+    torchrun --standalone --nproc_per_node=7 -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=7 -m scripts.base_loss
+    torchrun --standalone --nproc_per_node=7 -m scripts.base_eval
     echo "✓ Base model pretrained"
 else
     echo "[3/6] Base model already exists, skipping..."
@@ -105,8 +105,8 @@ if [ ! -f "outs/mid/ckpt.pt" ]; then
         curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
     fi
     
-    torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i mid
+    torchrun --standalone --nproc_per_node=7 -m scripts.mid_train -- --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=7 -m scripts.chat_eval -- -i mid
     echo "✓ Mid-training complete"
 else
     echo "[4/6] Mid-training checkpoint already exists, skipping..."
@@ -117,8 +117,8 @@ echo ""
 # Stage 4: Supervised Fine-Tuning (SFT)
 if [ ! -f "outs/sft/ckpt.pt" ]; then
     echo "[5/6] Supervised Fine-Tuning..."
-    torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+    torchrun --standalone --nproc_per_node=7 -m scripts.chat_sft -- --run=$WANDB_RUN
+    torchrun --standalone --nproc_per_node=7 -m scripts.chat_eval -- -i sft
     echo "✓ SFT complete"
 else
     echo "[5/6] SFT checkpoint already exists, skipping..."
@@ -136,7 +136,7 @@ echo "  [6b/6] Deduplicating prompts..."
 python -m scripts.kat_make_prompts
 
 echo "  [6c/6] Training Reward Model..."
-torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_rm -- --max_steps=1000
+torchrun --standalone --nproc_per_node=7 -m scripts.kat_train_rm -- --max_steps=1000
 
 echo "✓ Preference data pipeline complete"
 echo ""
@@ -146,7 +146,7 @@ echo ""
 echo "================================================================"
 echo "MAIN EXPERIMENT: GRPO with Density-Aware Sampling"
 echo "================================================================"
-torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo \
+torchrun --standalone --nproc_per_node=7 -m scripts.kat_train_grpo \
     --max_steps=5000 \
     --learning_rate=1e-5 \
     --beta=0.1 \
@@ -162,7 +162,7 @@ echo ""
 echo "================================================================"
 echo "BASELINE: GRPO without Density Sampling (uniform sampling)"
 echo "================================================================"
-torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo \
+torchrun --standalone --nproc_per_node=7 -m scripts.kat_train_grpo \
     --max_steps=5000 \
     --learning_rate=1e-5 \
     --beta=0.1 \
