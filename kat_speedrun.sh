@@ -2,11 +2,16 @@
 
 # KAT Speedrun: Density-Aware GRPO with Hypothesis Testing
 # 
-# Complete pipeline testing mode collapse reduction via density-aware sampling.
-# This script trains two models:
-#   1. GRPO with density-aware sampling (main experiment)
-#   2. GRPO without density sampling (control/baseline)
-# Then evaluates both on diversity metrics.
+# Complete pipeline for comparing reward models trained with different sampling strategies.
+# This script trains two reward models:
+#   1. Regular RM with uniform sampling (baseline)
+#   2. Density-Aware RM with inverse density sampling (commented out - for later experiments)
+#
+# Then runs GRPO training separately with each RM, both using uniform sampling during GRPO.
+# This enables testing the hypothesis that density-aware RM training improves policy learning.
+#
+# On first run: Only regular RM + GRPO (density sections commented out)
+# When ready to test: Uncomment sections to enable density-aware RM and comparisons
 #
 # Expected runtime: ~1-2 days on 8xH100 GPU node at $3/GPU/hour
 #
@@ -151,100 +156,139 @@ echo ""
 
 # =============================================================================
 # Stage 5: Pairwise Preference Data Pipeline
-echo "[6/8] Preparing pairwise preference data for GRPO..."
+echo "[6/9] Preparing pairwise preference data for GRPO..."
 
-echo "  [6a/8] Downloading preference pairs..."
+echo "  [6a/9] Downloading preference pairs..."
 python -m scripts.kat_download_pairs --only hh  # Start with just HH for speed
 
-echo "  [6b/8] Deduplicating prompts..."
+echo "  [6b/9] Deduplicating prompts..."
 python -m scripts.kat_make_prompts
 
-echo "  [6c/8] Training Reward Model..."
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm -- --max_steps=1000
-
-echo "✓ Preference data pipeline complete"
+echo ""
+echo "  [6c/9] Training Reward Models..."
 echo ""
 
 # =============================================================================
-# Stage 6: Offline Embeddings Computation (NEW!)
-echo "[7/8] Computing Offline Embeddings for Density-Aware Sampling..."
-echo ""
-echo "  This precomputes prompt embeddings and density weights."
-echo "  ⚡ GRPO training will start instantly (<1s) instead of waiting 3+ minutes"
-echo ""
-
-EMBEDDINGS_DIR="$NANOCHAT_BASE_DIR/data/embeddings_offline"
-
-# Check if embeddings already exist
-if [ -f "$EMBEDDINGS_DIR/density_weights.npy" ]; then
-    echo "  ✓ Embeddings already precomputed, skipping..."
+# RM Option 1: Regular Reward Model (uniform sampling - baseline)
+echo "  Training RM #1: Regular (uniform sampling)..."
+if [ ! -f "$NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/model_000000.pt" ]; then
+    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
+        --rm_source rm \
+        --max_steps=1000
+    echo "  ✓ RM #1 (uniform) trained"
 else
-    echo "  Computing embeddings (~5-10 minutes)..."
-    python -m scripts.kat_compute_embeddings_offline \
-        --base_model_source base \
-        --batch_size 8 \
-        --k 10 \
-        --output_dir $EMBEDDINGS_DIR
-    
-    if [ $? -eq 0 ]; then
-        echo "  ✓ Embeddings computed successfully"
-    else
-        echo "  ⚠️  Embedding computation failed, will fall back to online during training"
-    fi
+    echo "  ✓ RM #1 (uniform) already exists"
 fi
 echo ""
 
-# =============================================================================
-# Stage 7: GRPO Training - Main Experiment (with density sampling + offline embeddings)
-echo "================================================================"
-echo "MAIN EXPERIMENT: GRPO with Density-Aware Sampling"
-echo "  Using offline precomputed embeddings (instant startup!)"
-echo "================================================================"
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo \
-    --use_precomputed_embeddings \
-    --embeddings_dir $EMBEDDINGS_DIR \
-    --max_steps=5000 \
-    --learning_rate=1e-5 \
-    --beta=0.1 \
-    --density_aware=True \
-    --density_k=10 \
-    --out_dir outs/grpo_density
-
-echo "✓ GRPO with density sampling complete"
+echo "✓ Reward Models training complete"
 echo ""
 
 # =============================================================================
-# Stage 8: GRPO Training - Baseline (without density sampling + offline embeddings)
+# Stage 6 & RM #2: Density-Aware Setup (commented out for first run)
+# 
+# To enable density-aware experiments, uncomment the sections below IN THIS ORDER:
+#   1. First uncomment Stage 6 (Offline Embeddings)
+#   2. Then uncomment RM #2 (which depends on Stage 6)
+#   3. Then uncomment Stage 8 (GRPO with density RM)
+# ===
+
+# Stage 6: Offline Embeddings Computation
+# echo "[7/9] Computing Offline Embeddings for Density-Aware Sampling..."
+# echo ""
+# echo "  This precomputes prompt embeddings and density weights."
+# echo "  Required for RM #2 (density-aware) training."
+# echo ""
+# 
+# EMBEDDINGS_DIR="$NANOCHAT_BASE_DIR/data/embeddings_offline"
+# 
+# if [ ! -f "$EMBEDDINGS_DIR/density_weights.npy" ]; then
+#     echo "  Computing embeddings (~5-10 minutes)..."
+#     python -m scripts.kat_compute_embeddings_offline \
+#         --base_model_source base \
+#         --batch_size 8 \
+#         --k 10 \
+#         --output_dir $EMBEDDINGS_DIR
+#     
+#     if [ $? -eq 0 ]; then
+#         echo "  ✓ Embeddings computed successfully"
+#     else
+#         echo "  ⚠️  Embedding computation failed!"
+#         exit 1
+#     fi
+# else
+#     echo "  ✓ Embeddings already exist, skipping..."
+# fi
+# echo ""
+# 
+# # RM Option 2: Density-Aware Reward Model (depends on Stage 6 embeddings above)
+# echo "  Training RM #2: Density-Aware (inverse density sampling)..."
+# if [ ! -f "$NANOCHAT_BASE_DIR/rm_checkpoints/density/d20/model_000000.pt" ]; then
+#     EMBEDDINGS_DIR="$NANOCHAT_BASE_DIR/data/embeddings_offline"
+#     
+#     torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
+#         --rm_source rm_density \
+#         --max_steps=1000 \
+#         --density_aware \
+#         --embeddings_dir $EMBEDDINGS_DIR
+#     echo "  ✓ RM #2 (density) trained"
+# else
+#     echo "  ✓ RM #2 (density) already exists"
+# fi
+# echo ""
+
+echo ""
+
+# =============================================================================
+# Stage 7: GRPO Training - with Regular RM (uniform sampling on both RM and GRPO)
 echo "================================================================"
-echo "BASELINE: GRPO without Density Sampling (uniform sampling)"
-echo "  Using offline precomputed embeddings (instant startup!)"
+echo "EXPERIMENT 1: GRPO with Regular RM (uniform sampling)"
+echo "  Policy learns from RM trained with uniform sampling"
+echo "  Policy training also uses uniform sampling"
 echo "================================================================"
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo \
-    --use_precomputed_embeddings \
-    --embeddings_dir $EMBEDDINGS_DIR \
+    --rm_source rm \
+    --grpo_source grpo \
     --max_steps=5000 \
     --learning_rate=1e-5 \
-    --beta=0.1 \
-    --density_aware=False \
-    --out_dir outs/grpo_baseline
+    --beta=0.1
 
-echo "✓ GRPO baseline complete"
+echo "✓ GRPO with regular RM complete"
 echo ""
+
+# =============================================================================
+# Stage 8: GRPO Training - with Density-Aware RM (commented out for first run)
+# Uncomment this section to compare with density-aware RM
+# ===
+# echo "================================================================"
+# echo "EXPERIMENT 2: GRPO with Density-Aware RM (uniform GRPO sampling)"
+# echo "  Policy learns from RM trained with density-aware sampling"
+# echo "  Policy training uses uniform sampling (no density weighting in GRPO)"
+# echo "================================================================"
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo \
+#     --rm_source rm_density \
+#     --grpo_source grpo_density \
+#     --max_steps=5000 \
+#     --learning_rate=1e-5 \
+#     --beta=0.1
+# 
+# echo "✓ GRPO with density RM complete"
+# echo ""
+# ===
 
 # =============================================================================
 # Stage 9: Evaluation - Diversity Metrics
 echo "================================================================"
-echo "EVALUATION: Testing Hypothesis"
+echo "EVALUATION: Testing Output Quality"
 echo "================================================================"
 echo ""
-echo "Evaluating outputs for mode collapse indicators..."
-python -m scripts.kat_eval_diversity \
-    --density_model_path outs/grpo_density/ckpt.pt \
-    --baseline_model_path outs/grpo_baseline/ckpt.pt \
-    --output_report .cache/diversity_report.md
+echo "Evaluating outputs for diversity indicators..."
+# python -m scripts.kat_eval_diversity \
+#     --model_path outs/grpo_uniform/ckpt.pt \
+#     --output_report .cache/diversity_report.md
 
 echo ""
-echo "Report saved to: .cache/diversity_report.md"
+echo "Report location: .cache/diversity_report.md"
 echo ""
 
 # =============================================================================
@@ -255,31 +299,32 @@ echo "End time: $(date)"
 echo "================================================================================"
 echo ""
 echo "Pipeline stages:"
-echo "  ✓ [1/8] Environment setup"
-echo "  ✓ [2/8] Tokenizer training"
-echo "  ✓ [3/8] Base model pretraining"
-echo "  ✓ [4/8] Mid-training"
-echo "  ✓ [5/8] Supervised Fine-Tuning"
-echo "  ✓ [6/8] Preference data pipeline"
-echo "  ✓ [7/8] Offline embeddings computation"
-echo "  ✓ [8/8] GRPO training + evaluation"
+echo "  ✓ [1/9] Environment setup"
+echo "  ✓ [2/9] Tokenizer training"
+echo "  ✓ [3/9] Base model pretraining"
+echo "  ✓ [4/9] Mid-training"
+echo "  ✓ [5/9] Supervised Fine-Tuning"
+echo "  ✓ [6/9] Preference data pipeline (2 RMs: regular + density-aware)"
+echo "  ✓ [7/9] GRPO training with regular RM (uniform sampling)"
+echo "  ✓ [8/9] GRPO training with density-aware RM (commented out)"
+echo "  ✓ [9/9] Diversity evaluation"
 echo ""
 echo "Key outputs:"
-echo "  ✓ outs/grpo_density/ckpt.pt       (Main experiment with density sampling)"
-echo "  ✓ outs/grpo_baseline/ckpt.pt      (Baseline without density sampling)"
-echo "  ✓ .cache/diversity_report.md      (Diversity evaluation results)"
+echo "  ✓ \$NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/model_000000.pt"
+echo "      (Regular RM with uniform sampling)"
+echo "  ✓ \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_000000.pt"
+echo "      (GRPO with regular RM)"
+echo "  ✓ .cache/diversity_report.md         (Evaluation results)"
 echo ""
-echo "Offline embeddings:"
-echo "  ✓ $EMBEDDINGS_DIR/embeddings.npy"
-echo "  ✓ $EMBEDDINGS_DIR/density_weights.npy"
-echo "  ✓ $EMBEDDINGS_DIR/embeddings_metadata.json"
-echo ""
-echo "Training startup times:"
-echo "  Before: 240s (4 minutes) - compute embeddings online"
-echo "  After:  <1s (instant!)   - load precomputed embeddings"
+echo "To enable density-based RM and comparison:"
+echo "  1. Uncomment Stage 6 (Offline Embeddings) in this script"
+echo "  2. Uncomment RM #2 section (Density-Aware RM training)"
+echo "  3. Uncomment Stage 8 (GRPO with Density-Aware RM)"
+echo "  4. Uncomment evaluation section"
+echo "  5. Re-run: bash kat_speedrun.sh"
 echo ""
 echo "Next steps:"
-echo "  1. Review .cache/diversity_report.md for hypothesis validation"
-echo "  2. Interactive chat: python -m scripts.chat_cli --ckpt_path outs/grpo_density/ckpt.pt"
-echo "  3. Web UI: python -m scripts.chat_web --ckpt_path outs/grpo_density/ckpt.pt"
+echo "  1. Review diversity metrics and training logs"
+echo "  2. Interactive chat: python -m scripts.chat_cli --ckpt_path \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_000000.pt"
+echo "  3. Web UI: python -m scripts.chat_web --ckpt_path \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_000000.pt"
 echo ""

@@ -140,8 +140,12 @@ def load_model(source, *args, **kwargs):
         "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
-        "rm": "rm_checkpoints",
-        "grpo": "grpo_checkpoints",
+        # Reward Model variants
+        "rm": "rm_checkpoints/uniform",
+        "rm_density": "rm_checkpoints/density",
+        # GRPO variants
+        "grpo": "grpo_checkpoints/uniform",
+        "grpo_density": "grpo_checkpoints/density",
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)

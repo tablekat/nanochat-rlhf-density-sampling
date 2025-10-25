@@ -163,8 +163,8 @@ def main():
     # Paths
     default_pairs = os.path.join(get_base_dir(), "data", "pairs_all.jsonl")
     parser.add_argument("--pairs_path", default=default_pairs, help="Path to pairs JSONL")
-    parser.add_argument("--out_dir", default=os.path.join(get_base_dir(), "rm_checkpoints", "d20"), 
-                        help="Output directory for RM checkpoint")
+    parser.add_argument("--rm_source", default="rm", help="RM source name (rm|rm_density) - determines checkpoint location")
+    parser.add_argument("--out_dir", default=None, help="Output directory (overrides rm_source if provided)")
     parser.add_argument("--embeddings_dir", default=os.path.join(get_base_dir(), "data", "embeddings_offline"),
                         help="Path to embeddings directory with precomputed density weights")
     
@@ -181,6 +181,17 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
     parser.add_argument("--log_interval", type=int, default=100, help="Log interval")
     args = parser.parse_args()
+    
+    # Determine output directory from rm_source if not explicitly provided
+    if args.out_dir is None:
+        # Map rm_source to checkpoint directory
+        source_to_dir = {
+            "rm": os.path.join(get_base_dir(), "rm_checkpoints", "uniform", "d20"),
+            "rm_density": os.path.join(get_base_dir(), "rm_checkpoints", "density", "d20"),
+        }
+        if args.rm_source not in source_to_dir:
+            raise ValueError(f"Unknown rm_source: {args.rm_source}. Must be one of: {list(source_to_dir.keys())}")
+        args.out_dir = source_to_dir[args.rm_source]
     
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -248,13 +248,13 @@ def main():
     # Paths
     default_pairs = os.path.join(get_base_dir(), "data", "pairs_all.jsonl")
     default_prompts = os.path.join(get_base_dir(), "data", "prompts_all.jsonl")
-    default_out = os.path.join(get_base_dir(), "grpo_checkpoints", "d20")
     
     parser.add_argument("--pairs_path", default=default_pairs, help="Path to pairs")
     parser.add_argument("--prompts_path", default=default_prompts, help="Path to prompts")
     parser.add_argument("--sft_source", default="sft", help="Source for SFT model (sft|mid|base)")
-    parser.add_argument("--rm_source", default="rm", help="Source for RM model (rm|rm_baseline|rm_density)")
-    parser.add_argument("--out_dir", default=default_out, help="Output directory")
+    parser.add_argument("--rm_source", default="rm", help="Source for RM model (rm|rm_density)")
+    parser.add_argument("--grpo_source", default="grpo", help="Source name for GRPO output (grpo|grpo_density)")
+    parser.add_argument("--out_dir", default=None, help="Output directory (overrides grpo_source if provided)")
     
     # Training params
     parser.add_argument("--max_steps", type=int, default=5000, help="Max training steps")
@@ -264,12 +264,22 @@ def main():
     parser.add_argument("--log_interval", type=int, default=100, help="Log interval")
     args = parser.parse_args()
     
+    # Determine output directory from grpo_source if not explicitly provided
+    if args.out_dir is None:
+        source_to_dir = {
+            "grpo": os.path.join(get_base_dir(), "grpo_checkpoints", "uniform", "d20"),
+            "grpo_density": os.path.join(get_base_dir(), "grpo_checkpoints", "density", "d20"),
+        }
+        if args.grpo_source not in source_to_dir:
+            raise ValueError(f"Unknown grpo_source: {args.grpo_source}. Must be one of: {list(source_to_dir.keys())}")
+        args.out_dir = source_to_dir[args.grpo_source]
+    
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
     
     print("="*70)
-    print(f"GRPO Training (RM source: {args.rm_source})")
+    print(f"GRPO Training (RM source: {args.rm_source}, Output: {args.grpo_source})")
     print("="*70)
     
     # Load SFT checkpoint as policy
@@ -304,7 +314,7 @@ def main():
     # Load RM checkpoint
     print(f"Loading RM from {args.rm_source}...")
     try:
-        # Try to load as checkpoint_manager source first
+        # Load RM from source via checkpoint_manager
         rm_model, _, rm_meta = load_model(
             source=args.rm_source,
             device=device,
@@ -314,21 +324,10 @@ def main():
         rm_head.eval()
         print(f"✓ RM loaded")
     except Exception as e:
-        print(f"Warning: Could not load RM via checkpoint_manager: {e}")
-        print(f"Trying legacy RM checkpoint path...")
-        try:
-            rm_ckpt_path = os.path.join(get_base_dir(), "rm_checkpoints", "d20", "model_000000.pt")
-            rm_checkpoint = torch.load(rm_ckpt_path, map_location=device)
-            
-            from scripts.kat_train_rm import RewardModelHead
-            hidden_size = rm_checkpoint['config']['hidden_size']
-            rm_head = RewardModelHead(hidden_size).to(device)
-            rm_head.load_state_dict(rm_checkpoint['rm_head_state_dict'])
-            rm_head.eval()
-            print(f"✓ RM loaded from legacy path")
-        except Exception as e2:
-            print(f"Error loading RM: {e2}")
-            sys.exit(1)
+        print(f"Error loading RM from {args.rm_source}: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     
     # Load dataset
     print(f"Loading preference pairs from {args.pairs_path}...")

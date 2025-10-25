@@ -15,6 +15,8 @@ I'll need to think of actual evals to run. This is a TODO. Ideally I can compare
 ```
 sudo apt-get update -y && sudo apt-get install -y git python3-venv screen
 git clone https://github.com/tablekat/nanochat-rlhf-density-sampling.git
+screen -S speedrun
+
 cd nanochat-rlhf-density-sampling
 python3 -m venv .venv && source .venv/bin/activate
 
@@ -33,13 +35,11 @@ python -c "from fastapi import FastAPI; print('✓ fastapi')"
 
 
 # (optional) run speedrun to produce out/ckpt.pt + tokenizer.model
-screen -S speedrun
-cd nanochat-rlhf-density-sampling
-source .venv/bin/activate
-export NPROC=7
+<!-- export NPROC=7
 export WORLD_SIZE=7
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 bash kat_speedrun.sh # 7 because runpod had 7 because lambda.ai didn't accept my credit card.
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 bash kat_speedrun.sh # 7 because runpod had 7 because lambda.ai didn't accept my credit card. -->
+bash kat_speedrun.sh
 
 # detach: Ctrl-A then D; reattach: screen -r speedrun
 ```
