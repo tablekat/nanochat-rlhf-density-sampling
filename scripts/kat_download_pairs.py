@@ -2,7 +2,20 @@
 """
 Download open pairwise preference datasets and write a single JSONL:
   $NANOCHAT_BASE_DIR/data/pairs_all.jsonl
-Each line: {"id","prompt","chosen","rejected"}
+
+Each line format:
+  {
+    "id": uuid,
+    "prefix": {"messages": [{"role": "user", "content": "..."}, ...]},  # conversation ending with user message
+    "chosen": "assistant response string",
+    "rejected": "assistant response string",
+    "src": "hh-rlhf|ultrafeedback-binarized|stack-exchange-preferences"
+  }
+
+The "prefix" field is a full conversation object that can be directly used with:
+  - tokenizer.render_conversation() to get tokens for the full conversation
+  - tokenizer.render_for_completion() to get tokens up to assistant_start token
+  - reward model training to score chosen/rejected completions
 
 Datasets included (defaults):
   - Anthropic/hh-rlhf
@@ -33,27 +46,119 @@ def write_jsonl(rows, fout):
 
 def from_hh():
     ds = load_dataset("Anthropic/hh-rlhf")
-    def extract_first_pair(conv):
-        prompt = answer = None
-        for m in conv:
-            role = (m.get("role") or "").lower()
-            text = m.get("text") or ""
-            if role == "human" and prompt is None:
-                prompt = text
-            elif role == "assistant" and answer is None:
-                answer = text
-        return prompt, answer
+    # ds is jsonl of {"chosen", "rejected"} keys where each is a string like the following:
+    #```
+    # Human: What are some cuss words in english?
+    # Assistant: Here's an incomplete list.
+    # Ass ... (etc)
+    # Human: What's your favorite one?
+    # Assistant: Ass.
+    #```
+    
+    def parse_conversation(text: str) -> list:
+        """Parse conversation string with Human:/Assistant: markers into exchanges."""
+        exchanges = []
+        lines = text.split("\n")
+        current_role = None
+        current_text = []
+        
+        for line in lines:
+            line = line.rstrip()
+            
+            # Check for role markers
+            if line.startswith("Human:"):
+                # Start of human message
+                if current_role == "A" and current_text:
+                    # Store previous assistant message
+                    exchanges.append(("A", " ".join(current_text).strip()))
+                    current_text = []
+                current_role = "H"
+                # Extract text after the marker
+                current_text.append(line[6:].strip())
+            elif line.startswith("Assistant:"):
+                # Start of assistant message
+                if current_role == "H" and current_text:
+                    # Store previous human message
+                    exchanges.append(("H", " ".join(current_text).strip()))
+                    current_text = []
+                current_role = "A"
+                # Extract text after the marker
+                current_text.append(line[10:].strip())
+            elif current_role and line.strip():
+                # Continuation of current message
+                current_text.append(line.strip())
+        
+        # Store final message
+        if current_role and current_text:
+            exchanges.append((current_role, " ".join(current_text).strip()))
+        
+        return exchanges
+    
+    def extract_pairs_and_prefix(chosen_text: str, rejected_text: str):
+        """
+        Extract conversations and return:
+        - prefix: full conversation ending with final user message (as conversation object)
+        - chosen_response: assistant's chosen response (string)
+        - rejected_response: assistant's rejected response (string)
+        """
+        chosen_exchanges = parse_conversation(chosen_text)
+        rejected_exchanges = parse_conversation(rejected_text)
+        
+        if not chosen_exchanges or not rejected_exchanges:
+            return None, None, None
+        
+        # Extract responses from chosen/rejected conversations
+        chosen_response = None
+        rejected_response = None
+        
+        # Find last assistant response in each
+        for role, content in reversed(chosen_exchanges):
+            if role == "A" and chosen_response is None:
+                chosen_response = content
+                break
+        
+        for role, content in reversed(rejected_exchanges):
+            if role == "A" and rejected_response is None:
+                rejected_response = content
+                break
+        
+        if not chosen_response or not rejected_response:
+            return None, None, None
+        
+        # Build prefix from exchanges, alternating user/assistant
+        # We want to keep history up to the last user message before the final response
+        # Extract alternating user/assistant messages
+        messages = []
+        for role, content in chosen_exchanges:
+            if role == "H":
+                messages.append({"role": "user", "content": norm_space(content)})
+            elif role == "A":
+                messages.append({"role": "assistant", "content": norm_space(content)})
+        
+        # Remove the final assistant message if present (we want prefix to end with user)
+        if messages and messages[-1]["role"] == "assistant":
+            messages.pop()
+        
+        # Ensure we have at least a user message
+        if not messages or messages[-1]["role"] != "user":
+            return None, None, None
+        
+        prefix = {"messages": messages}
+        return prefix, chosen_response, rejected_response
 
     for split in ("train", "test"):
         for r in ds[split]:
-            p1,a1 = extract_first_pair(r["chosen"])
-            p2,a2 = extract_first_pair(r["rejected"])
-            if p1 and a1 and p2 and a2 and norm_space(p1) == norm_space(p2):
+            chosen_text = r.get("chosen") or ""
+            rejected_text = r.get("rejected") or ""
+            
+            prefix, chosen_response, rejected_response = extract_pairs_and_prefix(chosen_text, rejected_text)
+            
+            if prefix and chosen_response and rejected_response:
                 yield {
                     "id": str(uuid.uuid4()),
-                    "prompt": norm_space(p1),
-                    "chosen": norm_space(a1),
-                    "rejected": norm_space(a2),
+                    "prefix": prefix,
+                    "chosen": norm_space(chosen_response),
+                    "rejected": norm_space(rejected_response),
                     "src": "hh-rlhf",
                 }
 
@@ -64,9 +169,14 @@ def from_ultrafeedback_binarized():
         c = r.get("chosen")
         rej = r.get("rejected")
         if p and c and rej:
+            prefix = {
+                "messages": [
+                    {"role": "user", "content": norm_space(p)}
+                ]
+            }
             yield {
                 "id": str(uuid.uuid4()),
-                "prompt": norm_space(p),
+                "prefix": prefix,
                 "chosen": norm_space(c),
                 "rejected": norm_space(rej),
                 "src": "ultrafeedback-binarized",
@@ -85,9 +195,14 @@ def from_stack_exchange_prefs():
         a_win = r.get("winner") or r.get("chosen") or r.get("answer_0")
         a_lose = r.get("loser") or r.get("rejected") or r.get("answer_1")
         if q and a_win and a_lose:
+            prefix = {
+                "messages": [
+                    {"role": "user", "content": strip_html(q)}
+                ]
+            }
             yield {
                 "id": str(uuid.uuid4()),
-                "prompt": strip_html(q),
+                "prefix": prefix,
                 "chosen": norm_space(a_win),
                 "rejected": norm_space(a_lose),
                 "src": "stack-exchange-preferences",

@@ -52,6 +52,9 @@ pip install datasets ujson tqdm nltk numpy scipy scikit-learn && \
 pip install sentence-transformers umap-learn && \
 pip install fastapi uvicorn pydantic tensorboard regex python-multipart && \
 pip install transformers huggingface-hub
+pip install hf_transfer
+pip install psutil
+pip install tiktoken
 echo "✓ Python packages installed"
 echo ""
 

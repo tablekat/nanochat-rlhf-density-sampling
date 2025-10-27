@@ -12,7 +12,7 @@ I previously had thought this would come from a limitations of RMs, that they co
 
 I'll need to think of actual evals to run. This is a TODO. Ideally I can compare to papers doing similar diversity focused RL. Were I to find similar behavior such as overuse of em-dashes, a first past eval might be to do compare the model RL'd with and without density sampling. I suppose I could just take token frequency and compare maybe. I should maybe also find a way to intentionally induce bad behavior in the training data and then see if this mitigates it.
 
-```
+<!-- ```
 sudo apt-get update -y && sudo apt-get install -y git python3-venv screen
 git clone https://github.com/tablekat/nanochat-rlhf-density-sampling.git
 screen -S speedrun
@@ -39,16 +39,19 @@ python -c "from fastapi import FastAPI; print('✓ fastapi')"
 <!-- export NPROC=7
 export WORLD_SIZE=7
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 bash kat_speedrun.sh # 7 because runpod had 7 because lambda.ai didn't accept my credit card. -->
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 bash kat_speedrun.sh # 7 because runpod had 7 because lambda.ai didn't accept my credit card. -- >
+
 bash kat_speedrun.sh
 
 # detach: Ctrl-A then D; reattach: screen -r speedrun
-```
+
+```-->
 
 ```
 sudo apt-get update -y && sudo apt-get install -y git python3-venv screen
 git clone https://github.com/tablekat/nanochat-rlhf-density-sampling.git
 screen -S speedrun
+
 cd nanochat-rlhf-density-sampling/
 bash runpod.sh
 source .venv/bin/activate
@@ -57,6 +60,7 @@ export WANDB_RUN=density_experiment
 bash kat_speedrun.sh
 
 # fucking wandb: https://wandb.ai/authorize
+
 ```
 
 # Original readme!
