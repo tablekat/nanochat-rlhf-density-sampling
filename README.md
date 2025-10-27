@@ -26,6 +26,7 @@ pip install datasets ujson tqdm nltk numpy scipy scikit-learn && \
 pip install sentence-transformers umap-learn && \
 pip install fastapi uvicorn pydantic tensorboard regex python-multipart && \
 pip install transformers huggingface-hub
+pip install hf_transfer
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 python -c "from sentence_transformers import SentenceTransformer; print('✓ sentence-transformers')"
 python -c "import umap; print('✓ umap')"
@@ -52,6 +53,7 @@ cd nanochat-rlhf-density-sampling/
 bash runpod.sh
 source .venv/bin/activate
 export NANOCHAT_BASE_DIR=/workspace/nanochat
+export WANDB_RUN=density_experiment
 bash kat_speedrun.sh
 
 # fucking wandb: https://wandb.ai/authorize

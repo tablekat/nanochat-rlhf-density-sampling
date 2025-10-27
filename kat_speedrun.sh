@@ -23,7 +23,8 @@
 set -e  # Exit on error
 
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+# export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
+export NANOCHAT_BASE_DIR="/workspace/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # wandb logging setup (optional)
@@ -69,29 +70,25 @@ echo ""
 
 # =============================================================================
 # Stage 1: Train Tokenizer (if needed)
-if [ ! -f "$NANOCHAT_BASE_DIR/tokenizer/tokenizer.pkl" ]; then
-    echo "[2/6] Training Tokenizer..."
-    
-    # Install Rust / Cargo
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
-    
-    # Build rustbpe tokenizer
-    uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
-    
-    # Download pretraining data
-    python -m nanochat.dataset -n 8
-    python -m nanochat.dataset -n 240 &
-    DATASET_DOWNLOAD_PID=$!
-    
-    # Train tokenizer
-    python -m scripts.tok_train --max_chars=2000000000
-    python -m scripts.tok_eval
-    
-    echo "✓ Tokenizer trained"
-else
-    echo "[2/6] Tokenizer already exists, skipping..."
-fi
+echo "[2/6] Training Tokenizer..."
+
+# Install Rust / Cargo (idempotent)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# Build rustbpe tokenizer
+uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
+
+# Download pretraining data
+python -m nanochat.dataset -n 8
+python -m nanochat.dataset -n 240 &
+DATASET_DOWNLOAD_PID=$!
+
+# Train tokenizer
+python -m scripts.tok_train --max_chars=2000000000
+python -m scripts.tok_eval
+
+echo "✓ Tokenizer trained"
 echo ""
 
 # Wait for dataset download to complete (started during tokenizer training)
@@ -103,55 +100,46 @@ echo ""
 
 # =============================================================================
 # Stage 2: Pretrain Base Model
-if [ ! -f "$NANOCHAT_BASE_DIR/base_checkpoints/d20/model_000000.pt" ]; then
-    echo "[3/6] Pretraining base model (depth=20)..."
-    
-    # Download eval bundle if needed
-    if [ ! -d "$NANOCHAT_BASE_DIR/eval_bundle" ]; then
-        EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
-        curl -L -o eval_bundle.zip $EVAL_BUNDLE_URL
-        unzip -q eval_bundle.zip
-        rm eval_bundle.zip
-        mv eval_bundle $NANOCHAT_BASE_DIR
-    fi
-    
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
-    echo "✓ Base model pretrained"
-else
-    echo "[3/6] Base model already exists, skipping..."
+echo "[3/6] Pretraining base model (depth=20)..."
+
+# Download eval bundle if needed
+if [ ! -d "$NANOCHAT_BASE_DIR/eval_bundle" ]; then
+    echo "  Downloading evaluation bundle..."
+    EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
+    curl -L -o eval_bundle.zip $EVAL_BUNDLE_URL
+    unzip -q eval_bundle.zip
+    rm eval_bundle.zip
+    mv eval_bundle $NANOCHAT_BASE_DIR
 fi
+
+# Training scripts
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
+echo "✓ Base model pretrained"
 echo ""
 
 # =============================================================================
 # Stage 3: Mid-training (conversation special tokens, etc.)
-if [ ! -f "$NANOCHAT_BASE_DIR/mid_checkpoints/d20/model_000000.pt" ]; then
-    echo "[4/6] Mid-training..."
-    
-    # Download identity conversations
-    if [ ! -f "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" ]; then
-        curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
-    fi
-    
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
-    echo "✓ Mid-training complete"
-else
-    echo "[4/6] Mid-training checkpoint already exists, skipping..."
+echo "[4/6] Mid-training..."
+
+# Download identity conversations
+if [ ! -f "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" ]; then
+    echo "  Downloading identity conversations..."
+    curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 fi
+
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
+echo "✓ Mid-training complete"
 echo ""
 
 # =============================================================================
 # Stage 4: Supervised Fine-Tuning (SFT)
-if [ ! -f "$NANOCHAT_BASE_DIR/chatsft_checkpoints/d20/model_000000.pt" ]; then
-    echo "[5/6] Supervised Fine-Tuning..."
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
-    echo "✓ SFT complete"
-else
-    echo "[5/6] SFT checkpoint already exists, skipping..."
-fi
+echo "[5/6] Supervised Fine-Tuning..."
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i sft
+echo "✓ SFT complete"
 echo ""
 
 # =============================================================================
@@ -170,15 +158,12 @@ echo ""
 
 # =============================================================================
 # RM Option 1: Regular Reward Model (uniform sampling - baseline)
+# Output: $NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/model_*.pt
 echo "  Training RM #1: Regular (uniform sampling)..."
-if [ ! -f "$NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/model_000000.pt" ]; then
-    torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
-        --rm_source rm \
-        --max_steps=1000
-    echo "  ✓ RM #1 (uniform) trained"
-else
-    echo "  ✓ RM #1 (uniform) already exists"
-fi
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
+    --rm_source rm \
+    --max_steps=1000
+echo "  ✓ RM #1 (uniform) trained"
 echo ""
 
 echo "✓ Reward Models training complete"
@@ -194,6 +179,7 @@ echo ""
 # ===
 
 # Stage 6: Offline Embeddings Computation
+# Output: $NANOCHAT_BASE_DIR/data/embeddings_offline/density_weights.npy
 # echo "[7/9] Computing Offline Embeddings for Density-Aware Sampling..."
 # echo ""
 # echo "  This precomputes prompt embeddings and density weights."
@@ -202,45 +188,31 @@ echo ""
 # 
 # EMBEDDINGS_DIR="$NANOCHAT_BASE_DIR/data/embeddings_offline"
 # 
-# if [ ! -f "$EMBEDDINGS_DIR/density_weights.npy" ]; then
-#     echo "  Computing embeddings (~5-10 minutes)..."
-#     python -m scripts.kat_compute_embeddings_offline \
-#         --base_model_source base \
-#         --batch_size 8 \
-#         --k 10 \
-#         --output_dir $EMBEDDINGS_DIR
-#     
-#     if [ $? -eq 0 ]; then
-#         echo "  ✓ Embeddings computed successfully"
-#     else
-#         echo "  ⚠️  Embedding computation failed!"
-#         exit 1
-#     fi
-# else
-#     echo "  ✓ Embeddings already exist, skipping..."
-# fi
+# echo "  Computing embeddings (~5-10 minutes)..."
+# python -m scripts.kat_compute_embeddings_offline \
+#     --base_model_source base \
+#     --batch_size 8 \
+#     --k 10 \
+#     --output_dir $EMBEDDINGS_DIR
+# echo "  ✓ Embeddings computed successfully"
 # echo ""
 # 
 # # RM Option 2: Density-Aware Reward Model (depends on Stage 6 embeddings above)
+# # Output: $NANOCHAT_BASE_DIR/rm_checkpoints/density/d20/model_*.pt
 # echo "  Training RM #2: Density-Aware (inverse density sampling)..."
-# if [ ! -f "$NANOCHAT_BASE_DIR/rm_checkpoints/density/d20/model_000000.pt" ]; then
-#     EMBEDDINGS_DIR="$NANOCHAT_BASE_DIR/data/embeddings_offline"
-#     
-#     torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
-#         --rm_source rm_density \
-#         --max_steps=1000 \
-#         --density_aware \
-#         --embeddings_dir $EMBEDDINGS_DIR
-#     echo "  ✓ RM #2 (density) trained"
-# else
-#     echo "  ✓ RM #2 (density) already exists"
-# fi
+# EMBEDDINGS_DIR="$NANOCHAT_BASE_DIR/data/embeddings_offline"
+# 
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
+#     --rm_source rm_density \
+#     --max_steps=1000
+# echo "  ✓ RM #2 (density) trained"
 # echo ""
 
 echo ""
 
 # =============================================================================
 # Stage 7: GRPO Training - with Regular RM (uniform sampling on both RM and GRPO)
+# Output: $NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_*.pt
 echo "================================================================"
 echo "EXPERIMENT 1: GRPO with Regular RM (uniform sampling)"
 echo "  Policy learns from RM trained with uniform sampling"
@@ -258,6 +230,7 @@ echo ""
 
 # =============================================================================
 # Stage 8: GRPO Training - with Density-Aware RM (commented out for first run)
+# Output: $NANOCHAT_BASE_DIR/grpo_checkpoints/density/d20/model_*.pt
 # Uncomment this section to compare with density-aware RM
 # ===
 # echo "================================================================"
@@ -310,10 +283,10 @@ echo "  ✓ [8/9] GRPO training with density-aware RM (commented out)"
 echo "  ✓ [9/9] Diversity evaluation"
 echo ""
 echo "Key outputs:"
-echo "  ✓ \$NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/model_000000.pt"
-echo "      (Regular RM with uniform sampling)"
-echo "  ✓ \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_000000.pt"
-echo "      (GRPO with regular RM)"
+echo "  ✓ \$NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/"
+echo "      (Regular RM with uniform sampling, timestamped)"
+echo "  ✓ \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/"
+echo "      (GRPO with regular RM, timestamped)"
 echo "  ✓ .cache/diversity_report.md         (Evaluation results)"
 echo ""
 echo "To enable density-based RM and comparison:"
@@ -325,6 +298,6 @@ echo "  5. Re-run: bash kat_speedrun.sh"
 echo ""
 echo "Next steps:"
 echo "  1. Review diversity metrics and training logs"
-echo "  2. Interactive chat: python -m scripts.chat_cli --ckpt_path \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_000000.pt"
-echo "  3. Web UI: python -m scripts.chat_web --ckpt_path \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_000000.pt"
+echo "  2. Interactive chat: python -m scripts.chat_cli --ckpt_path \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_*.pt"
+echo "  3. Web UI: python -m scripts.chat_web --ckpt_path \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/model_*.pt"
 echo ""
