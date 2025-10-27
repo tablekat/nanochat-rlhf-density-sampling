@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Reward Model (RM) training — loss-weighted (inverse-density) instead of sampler-weighted.
+Reward Model (RM) training with inverse-density loss weighting.
 
-Design notes
-- Keeps "nanochat-y" single-file style: argparse, simple dataset, clear training loop.
-- Applies prompt inverse-density as a PER-EXAMPLE LOSS WEIGHT (not WeightedRandomSampler).
-- Freezes the SFT backbone; trains a tiny linear RewardHead on the last-token features.
-- Truncation prioritizes response tokens while preserving a minimum prompt context.
-- DDP-friendly: rank-0 logging/saving; optional DistributedSampler.
+Run as:
+  python -m scripts.kat_train_rm
 
-Assumptions
-- pairs_all.jsonl lines: {"id", "prompt", "chosen", "rejected", "src"}
-- prompts_all.jsonl lines: {"id": md5_16(prompt), "prompt": "..."} (for joining density)
-- density_weights.npy aligns with prompts_all.jsonl order.
-- Tokenizer provides .encode(str) -> List[int].
-- Backbone "policy" returns logits (B,T,V); if hidden states are available, see TODO near extract_features().
+Or distributed:
+  torchrun --nproc_per_node=8 -m scripts.kat_train_rm --rm_source rm
 
-If your tokenizer/model names differ, adjust the imports in `build_tokenizer()` and `build_backbone()`.
+Design notes:
+- Per-example loss weighting (inverse-density) instead of sampler-weighted
+- Freezes SFT backbone; trains tiny linear RewardHead on last-token features
+- DDP-friendly with rank-0 logging/saving
 """
 
-from __future__ import annotations
-import os, json, math, time, argparse, hashlib, random
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import json, math, time, hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -31,133 +26,70 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from torch.distributed import is_initialized as dist_is_init, get_rank as dist_rank, get_world_size as dist_ws, init_process_group, barrier
-from tqdm import tqdm
 
-# Use nanochat library functions
-from nanochat.common import get_base_dir as nc_get_base_dir
-from nanochat.checkpoint_manager import load_model as nc_load_model
+import wandb
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, autodetect_device_type, get_base_dir, print_banner
+from nanochat.checkpoint_manager import load_model
+from nanochat.tokenizer import get_tokenizer
 
+print_banner()
 
-# -------------------
-# Paths & utilities
-# -------------------
+# ═════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═════════════════════════════════════════════════════════════════════════════
+
+run = "dummy"  # wandb run name ("dummy" = no wandb logging)
+device_type = ""  # cuda|cpu|mps (empty => autodetect)
+rm_source = "rm"  # rm|rm_density
+batch_size = 64
+learning_rate = 5e-4
+weight_decay = 0.0
+max_steps = 1000
+log_every = 25
+eval_every = -1  # -1 = disable
+
+# Data paths and processing
+pairs_path = None  # Auto-resolved
+density_weights_path = None  # Auto-resolved
+weight_mode = "mean"  # mean|sum|none
+weight_cap = None  # clip weights to max value
+max_len = 512
+min_prompt = 128
+
+# Tokenizer
+tokenizer_path = "tokenizer.model"
+hf_fallback = None
+
+# Config override via CLI
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+exec(open(os.path.join('nanochat', 'configurator.py')).read())
+user_config = {k: globals()[k] for k in config_keys}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Distributed setup
+# ═════════════════════════════════════════════════════════════════════════════
+
+device_type = autodetect_device_type() if device_type == "" else device_type
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+master_process = ddp_rank == 0
+
+# WandB logging
+use_dummy_wandb = run == "dummy" or not master_process
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rm", name=run, config=user_config)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Utilities & Data structures
+# ═════════════════════════════════════════════════════════════════════════════
 
 def md5_16(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:16]
-
-def is_main_process() -> bool:
-    return (not dist_is_init()) or (dist_rank() == 0)
-
-def setup_ddp_if_needed():
-    # Initialize DDP if torchrun used
-    if "RANK" in os.environ and not dist_is_init():
-        init_process_group(backend="nccl")
-        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-
-
-# -------------------
-# Tokenizer
-# -------------------
-
-class TokenizerWrapper:
-    """
-    Thin wrapper so we don't depend on any single tokenizer implementation.
-    Tries nanochat RustBPE first; falls back to HF if requested.
-    """
-    def __init__(self, tokenizer_path: Optional[str], hf_fallback: Optional[str]):
-        self.impl = None
-        self.kind = None
-        if tokenizer_path is not None:
-            try:
-                # nanochat/rustbpe build (most likely in your repo)
-                from rustbpe import Tokenizer as RustTokenizer  # type: ignore
-                self.impl = RustTokenizer.from_file(tokenizer_path)
-                self.kind = "rustbpe"
-            except Exception as e:
-                if hf_fallback is None:
-                    raise RuntimeError(
-                        f"Failed to load rustbpe tokenizer at {tokenizer_path}. "
-                        f"Install/compile rustbpe or pass --hf_fallback."
-                    ) from e
-
-        if self.impl is None:
-            # Use HF fallback
-            from transformers import AutoTokenizer
-            self.impl = AutoTokenizer.from_pretrained(hf_fallback, use_fast=True)
-            # make sure pad exists for collate convenience
-            if self.impl.pad_token_id is None:
-                self.impl.pad_token = self.impl.eos_token or "<|pad|>"
-            self.kind = "hf"
-
-    @property
-    def pad_id(self) -> int:
-        if self.kind == "rustbpe":
-            # RustBPE in nanochat may not define a special pad token.
-            # We rely on attention masks to ignore pads; use 0 as inert pad id.
-            return 0
-        else:
-            return int(self.impl.pad_token_id)
-
-    def encode(self, s: str) -> List[int]:
-        if self.kind == "rustbpe":
-            return self.impl.encode(s)
-        else:
-            return self.impl.encode(s, add_special_tokens=False)
-
-    def batch_encode(self, texts: List[str]) -> List[List[int]]:
-        return [self.encode(t) for t in texts]
-
-
-# -------------------
-# Backbone model
-# -------------------
-
-def build_backbone(device: torch.device, dtype: torch.dtype):
-    """
-    Create the frozen SFT backbone used to extract features for RM.
-    Uses nanochat checkpoint_manager for proper model loading.
-    """
-    try:
-        # Use proper nanochat loader with source="sft"
-        model, tokenizer_unused, _ = nc_load_model(source="sft", device=device, phase="eval")
-        model = model.to(device=device, dtype=dtype).eval()
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load SFT model from nanochat checkpoints: {e}\n"
-            f"Ensure chatsft_checkpoints/d20/model_*.pt exists."
-        )
-    
-    for p in model.parameters():
-        p.requires_grad_(False)
-    return model
-
-
-class RewardHead(nn.Module):
-    """
-    Minimal linear head mapping last-token features to a scalar.
-    Default features are the final-token LOGITS vector (V-dim), which we always have.
-    If you prefer hidden states, see extract_features() TODO.
-    """
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.fc = nn.Linear(in_dim, 1, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, D) -> (B,)
-        return self.fc(x).squeeze(-1)
-
-
-# -------------------
-# Data
-# -------------------
 
 @dataclass
 class PairRow:
     prompt: str
     chosen: str
     rejected: str
-    weight: float  # loss weight
+    weight: float
 
 class PairsDataset(Dataset):
     def __init__(self, pairs_path: Path, density: Optional[Dict[str, float]]):
@@ -172,18 +104,27 @@ class PairsDataset(Dataset):
                     prompt=ex["prompt"], chosen=ex["chosen"],
                     rejected=ex["rejected"], weight=w
                 ))
+    
+    def __len__(self): 
+        return len(self.rows)
+    
+    def __getitem__(self, idx: int) -> PairRow: 
+        return self.rows[idx]
 
-    def __len__(self): return len(self.rows)
-    def __getitem__(self, idx: int) -> PairRow: return self.rows[idx]
+class RewardHead(nn.Module):
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, 1, bias=True)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x).squeeze(-1)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Helper functions
+# ═════════════════════════════════════════════════════════════════════════════
 
-def load_density_mapping(
-    prompts_path: Path, weights_path: Path
-) -> Dict[str, float]:
-    """
-    Build: prompt_md5_16 -> inverse-density weight
-    """
-    # read prompts_all.jsonl to preserve order
+def load_density_mapping(prompts_path: Path, weights_path: Path) -> Dict[str, float]:
+    """Build prompt_id -> inverse-density weight mapping."""
     ids: List[str] = []
     with prompts_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -192,132 +133,65 @@ def load_density_mapping(
     assert len(ids) == len(weights), "prompts_all.jsonl and density_weights.npy misaligned"
     return {pid: float(w) for pid, w in zip(ids, weights.tolist())}
 
-
-def truncate_two(
-    tok_ids_prompt: List[int],
-    tok_ids_resp: List[int],
-    max_len: int,
-    min_prompt: int,
-) -> Tuple[List[int], List[int]]:
-    """
-    Trim from left of prompt and right of response to fit max_len.
-    Reserve `min_prompt` tokens for prompt if possible, and let response use the rest.
-    """
-    p, r = tok_ids_prompt, tok_ids_resp
-    # If already fit:
+def truncate_two(p: List[int], r: List[int], max_len: int, min_prompt: int) -> Tuple[List[int], List[int]]:
+    """Trim prompt from left, response from right, preserving response priority."""
     if len(p) + len(r) <= max_len:
         return p, r
-
-    # budget
     resp_budget = max_len - min(len(p), min_prompt)
     resp_budget = max(resp_budget, 1)
-
-    # trim response from the right
-    r = r[:max(0, resp_budget)]
-
-    # trim prompt from left if still too long
+    r = r[:resp_budget]
     over = (len(p) + len(r)) - max_len
     if over > 0:
         p = p[over:]
-
     return p, r
 
-
-def make_batch(
-    tok: TokenizerWrapper,
-    rows: List[PairRow],
-    max_len: int,
-    min_prompt: int,
-    device: torch.device,
-):
-    """
-    Build tensors for (prompt+chosen) and (prompt+rejected).
-    Labels mask out the prompt tokens (-100) so losses/logprobs are over the response only.
-    """
-    B = len(rows)
-    enc_p = tok.batch_encode([r.prompt for r in rows])
-    enc_c = tok.batch_encode([r.chosen for r in rows])
-    enc_r = tok.batch_encode([r.rejected for r in rows])
-
-    pcs, prs = [], []
-    ccs, c_labels = [], []
-    rrs, r_labels = [], []
-    weights = torch.tensor([r.weight for r in rows], dtype=torch.float32, device=device)
-
-    for p_ids, c_ids, r_ids in zip(enc_p, enc_c, enc_r):
-        p_trim, c_trim = truncate_two(p_ids, c_ids, max_len, min_prompt)
-        _,      r_trim = truncate_two(p_ids, r_ids, max_len, min_prompt)
-        # concat
-        pc = p_trim + c_trim
-        pr = p_trim + r_trim
+def make_batch(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, device: torch.device, pad_id: int):
+    """Prepare batch tensors with per-example weights."""
+    pcs, prs, ccs, rrs = [], [], [], []
+    weights = []
+    
+    for row in rows:
+        p = tokenizer.encode(row.prompt)
+        c = tokenizer.encode(row.chosen)
+        r = tokenizer.encode(row.rejected)
+        
+        p1, c1 = truncate_two(p, c, max_len, min_prompt)
+        p2, r2 = truncate_two(p, r, max_len, min_prompt)
+        
+        pc, pr = p1 + c1, p2 + r2
+        lc = [-100]*len(p1) + c1
+        lr = [-100]*len(p2) + r2
+        
         pcs.append(pc); prs.append(pr)
-        # labels mask prompt
-        lc = [-100]*len(p_trim) + c_trim
-        lr = [-100]*len(p_trim) + r_trim
         ccs.append(lc); rrs.append(lr)
-
-    # pad to max length in batch
-    maxT_c = max(len(x) for x in pcs)
-    maxT_r = max(len(x) for x in prs)
-
-    def pad_batch(xs, pad_id):
-        pad_x = [x + [pad_id]*(max_len - len(x)) if len(x) < max_len else x for x in xs]
-        return torch.tensor(pad_x, dtype=torch.long, device=device)
-
+        weights.append(row.weight)
+    
+    def pad_batch(xs):
+        xs = [x[:max_len] for x in xs]
+        return torch.tensor([x + [pad_id]*(max_len - len(x)) for x in xs], dtype=torch.long, device=device)
+    
     def pad_labels(ls):
-        pad_l = [l + [-100]*(max_len - len(l)) if len(l) < max_len else l for l in ls]
-        return torch.tensor(pad_l, dtype=torch.long, device=device)
-
-    # enforce hard cap max_len
-    pcs = [x[:max_len] for x in pcs]
-    prs = [x[:max_len] for x in prs]
-    ccs = [x[:max_len] for x in ccs]
-    rrs = [x[:max_len] for x in rrs]
-
-    x_c = pad_batch(pcs, tok.pad_id)
-    x_r = pad_batch(prs, tok.pad_id)
-    y_c = pad_labels(ccs)
-    y_r = pad_labels(rrs)
-
-    return x_c, y_c, x_r, y_r, weights
-
-
-# -------------------
-# RM loss
-# -------------------
+        ls = [l[:max_len] for l in ls]
+        return torch.tensor([l + [-100]*(max_len - len(l)) for l in ls], dtype=torch.long, device=device)
+    
+    return (pad_batch(pcs), pad_labels(ccs), pad_batch(prs), pad_labels(rrs), 
+            torch.tensor(weights, dtype=torch.float32, device=device))
 
 @torch.no_grad()
 def extract_features(backbone, x: torch.Tensor, pad_id: int) -> torch.Tensor:
-    """
-    Returns a (B, D) feature per sequence. Default uses last-token LOGITS vector.
-
-    If your backbone can return hidden states, you may switch to hidden features:
-    - Example: logits, h = backbone(x, return_hidden=True); take last non-pad row from `h`.
-    - Then change `features_dim = logits.size(-1)` to `h.size(-1)` below.
-    """
-    logits = backbone(x)  # (B,T,V)
-    # compute last non-pad index per row
-    with torch.no_grad():
-        mask = (x != pad_id).to(x.dtype)  # (B,T)
-        lengths = mask.sum(dim=1).clamp(min=1)  # (B,)
-        idx = (lengths - 1).long()  # last token index
-        out = logits[torch.arange(x.size(0), device=x.device), idx]  # (B,V)
-    return out  # features dim == V
-
+    """Extract last-token logits as features."""
+    logits = backbone(x)
+    mask = (x != pad_id).to(x.dtype)
+    lengths = mask.sum(dim=1).clamp(min=1)
+    idx = (lengths - 1).long()
+    return logits[torch.arange(x.size(0), device=x.device), idx]
 
 def bt_loss(reward_ch: torch.Tensor, reward_rj: torch.Tensor) -> torch.Tensor:
-    """Bradley–Terry pairwise loss per example: -logsigmoid(r_c - r_r)."""
-    return F.softplus(-(reward_ch - reward_rj))  # numerically stable
-
+    """Bradley–Terry pairwise loss."""
+    return F.softplus(-(reward_ch - reward_rj))
 
 def apply_weights(loss_per_ex: torch.Tensor, w: torch.Tensor, mode: str, cap: Optional[float]) -> torch.Tensor:
-    """
-    Weight the per-example losses:
-    - mode='mean': divide by mean(w) => keeps LR scale stable when weights vary
-    - mode='sum': normalize w to sum == batch_size
-    - mode='none': use raw w (not recommended)
-    - cap: optional clip of w to [0, cap] to reduce variance
-    """
+    """Apply per-example weight normalization."""
     if cap is not None:
         w = torch.clamp(w, max=cap)
     if mode == "mean":
@@ -328,139 +202,129 @@ def apply_weights(loss_per_ex: torch.Tensor, w: torch.Tensor, mode: str, cap: Op
         wn = w
     return (wn * loss_per_ex).mean()
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Training
+# ═════════════════════════════════════════════════════════════════════════════
 
-# -------------------
-# Train
-# -------------------
+# Resolve paths and config
+base = get_base_dir()
+save_dir_mapping = {
+    "rm": os.path.join(base, "rm_checkpoints", "uniform", "d20"),
+    "rm_density": os.path.join(base, "rm_checkpoints", "density", "d20"),
+}
+save_dir = save_dir_mapping[rm_source]
+density_aware = rm_source == "rm_density"
 
-def main():
-    p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    base = nc_get_base_dir()
+if pairs_path is None:
+    pairs_path = os.path.join(base, "data", "pairs_all.jsonl")
+if density_weights_path is None:
+    density_weights_path = os.path.join(base, "data", "embeddings_offline", "density_weights.npy")
+
+# Load backbone
+print0(f"Loading SFT backbone...")
+backbone, tokenizer, _ = load_model(source="sft", device=device, phase="eval")
+backbone.eval()
+for p in backbone.parameters():
+    p.requires_grad_(False)
+
+hidden_size = getattr(getattr(backbone, "config", None), "n_embd", None)
+if hidden_size is None:
+    raise RuntimeError("model.config.n_embd not found")
+
+pad_id = tokenizer.encode_special("<|assistant_end|>")
+
+# Load or build dataset
+print0(f"Loading preference dataset from {pairs_path}...")
+density = None
+if density_aware:
+    print0(f"Loading density weights from {density_weights_path}...")
+    prompts_path = os.path.join(base, "data", "prompts_all.jsonl")
+    density = load_density_mapping(Path(prompts_path), Path(density_weights_path))
+
+ds = PairsDataset(Path(pairs_path), density)
+print0(f"Dataset size: {len(ds)} pairs | density_aware={density_aware}")
+
+# DataLoader with DistributedSampler
+sampler = DistributedSampler(ds, shuffle=True) if ddp else None
+dl = DataLoader(ds, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler,
+                num_workers=2, pin_memory=True, drop_last=True)
+
+# Reward head
+print0(f"Building RewardHead with input_dim={hidden_size}...")
+head = RewardHead(in_dim=hidden_size).to(device)
+opt = torch.optim.AdamW(head.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Mkdir
+if master_process:
+    os.makedirs(save_dir, exist_ok=True)
+
+# Training loop
+print0(f"Starting training: {max_steps} steps, batch_size={batch_size}")
+step = 0
+t0 = time.time()
+
+while step < max_steps:
+    if sampler is not None:
+        sampler.set_epoch(step)
     
-    # Mapping for rm_source parameter
-    save_dir_mapping = {
-        "rm": os.path.join(base, "rm_checkpoints", "uniform", "d20"),
-        "rm_density": os.path.join(base, "rm_checkpoints", "density", "d20"),
-    }
-    
-    p.add_argument("--rm_source", type=str, default="rm", 
-                   choices=["rm", "rm_density"],
-                   help="determines output directory and whether to load density weights")
-    p.add_argument("--pairs_path", type=str, default=str(Path(base) / "data" / "pairs_all.jsonl"))
-    p.add_argument("--prompts_path", type=str, default=str(Path(base) / "data" / "prompts_all.jsonl"))
-    p.add_argument("--density_weights_path", type=str, default=str(Path(base) / "data" / "embeddings_offline" / "density_weights.npy"))
-    p.add_argument("--weight_mode", type=str, choices=["mean","sum","none"], default="mean",
-                   help="how to normalize per-example weights inside the loss")
-    p.add_argument("--weight_cap", type=float, default=None, help="optional upper clip for per-example weights")
-    p.add_argument("--tokenizer_path", type=str, default="tokenizer.model", help="nanochat RustBPE tokenizer file")
-    p.add_argument("--hf_fallback", type=str, default=None, help="HF tokenizer name (e.g. 'gpt2') if RustBPE not available")
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32","bfloat16","float16"])
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--max_len", type=int, default=512)
-    p.add_argument("--min_prompt", type=int, default=128)
-    p.add_argument("--lr", type=float, default=5e-4)
-    p.add_argument("--wd", type=float, default=0.0)
-    p.add_argument("--max_steps", type=int, default=1000)
-    p.add_argument("--log_every", type=int, default=25)
-    args = p.parse_args()
-
-    # Resolve output directory from rm_source and auto-enable density_aware if needed
-    args.save_dir = save_dir_mapping[args.rm_source]
-    density_aware_auto = args.rm_source == "rm_density"
-    
-    setup_ddp_if_needed()
-    device = torch.device(args.device)
-    dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
-
-    # tokenizer
-    tok = TokenizerWrapper(args.tokenizer_path, args.hf_fallback)
-
-    # density map (prompt_id -> weight)
-    density = None
-    if density_aware_auto:
-        density = load_density_mapping(Path(args.prompts_path), Path(args.density_weights_path))
-
-    # dataset & loader
-    ds = PairsDataset(Path(args.pairs_path), density)
-    sampler = DistributedSampler(ds, shuffle=True) if dist_is_init() else None
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=(sampler is None), sampler=sampler,
-                    num_workers=2, pin_memory=True, drop_last=True)
-
-    # backbone (frozen)
-    backbone = build_backbone(device, dtype)
-    # build a dummy batch to determine feature dim
-    tmp_rows = [ds[i] for i in range(min(len(ds), 2))]
-    x_c, y_c, _, _, _ = make_batch(tok, tmp_rows, args.max_len, args.min_prompt, device)
-    with torch.no_grad():
-        feats = extract_features(backbone, x_c, tok.pad_id)  # (B, Dfeat)
-    head = RewardHead(in_dim=feats.size(-1)).to(device=device, dtype=dtype)
-    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.wd)
-
-    if is_main_process():
-        os.makedirs(args.save_dir, exist_ok=True)
-        print(f"RM training: {len(ds)} pairs | source={args.rm_source} | density_aware={density_aware_auto} weight_mode={args.weight_mode}")
-
-    step = 0
-    t0 = time.time()
-    while step < args.max_steps:
-        if sampler is not None:
-            sampler.set_epoch(step)
-        for _rows in dl:
-            step += 1
-            if step > args.max_steps:
-                break
-
-            x_c, y_c, x_r, y_r, w = make_batch(tok, _rows, args.max_len, args.min_prompt, device)
-            # features
+    for _rows in dl:
+        step += 1
+        if step > max_steps:
+            break
+        
+        x_c, y_c, x_r, y_r, w = make_batch(_rows, tokenizer, max_len, min_prompt, device, pad_id)
+        
+        # Forward
+        with torch.no_grad():
+            fc = extract_features(backbone, x_c, pad_id)
+            fr = extract_features(backbone, x_r, pad_id)
+        
+        rc = head(fc)
+        rr = head(fr)
+        loss_vec = bt_loss(rc, rr)
+        loss = apply_weights(loss_vec, w, weight_mode, weight_cap)
+        
+        # Backward
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+        opt.step()
+        
+        # Logging
+        if step % log_every == 0:
             with torch.no_grad():
-                fc = extract_features(backbone, x_c, tok.pad_id)  # (B,Df)
-                fr = extract_features(backbone, x_r, tok.pad_id)  # (B,Df)
-            # reward
-            rc = head(fc.to(dtype))
-            rr = head(fr.to(dtype))
-            # loss
-            loss_vec = bt_loss(rc, rr)  # (B,)
-            loss = apply_weights(loss_vec, w, args.weight_mode, args.weight_cap)
+                margin = (rc - rr).mean().item()
+                lw_mean = loss_vec.mean().item()
+                w_mean = w.mean().item()
+            
+            print0(f"step {step:06d}/{max_steps:06d} | loss {loss.item():.4f} (ex {lw_mean:.4f}) | "
+                  f"margin {margin:+.4f} | w_mean {w_mean:.4g}")
+            
+            wandb_run.log({
+                "step": step,
+                "loss": loss.item(),
+                "loss_ex_mean": lw_mean,
+                "reward_margin": margin,
+                "weight_mean": w_mean,
+            })
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
-            opt.step()
-
-            if is_main_process() and (step % args.log_every == 0):
-                dt = time.time() - t0
-                with torch.no_grad():
-                    margin = (rc - rr).mean().item()
-                    lw_mean = loss_vec.mean().item()
-                    w_mean = w.mean().item()
-                print(f"step {step:06d} | loss {loss.item():.4f} (ex {lw_mean:.4f}) | "
-                      f"margin {margin:+.4f} | w_mean {w_mean:.4g} | dt {dt:.1f}s")
-                t0 = time.time()
-
-    # save (rank 0 only)
-    if is_main_process():
-        ckpt = {
-            "rm_head_state_dict": head.state_dict(),
-            "meta": {
-                "features_dim": feats.size(-1),
-                "weight_mode": args.weight_mode,
-                "weight_cap": args.weight_cap,
-                "density_aware": density_aware_auto,
-                "tokenizer_kind": tok.kind,
-                "pad_id": int(tok.pad_id),
-                "max_len": args.max_len,
-                "min_prompt": args.min_prompt,
-                "dtype": args.dtype,
-            }
+# Checkpoint
+if master_process:
+    ckpt = {
+        "rm_head_state_dict": head.state_dict(),
+        "meta": {
+            "features_dim": hidden_size,
+            "weight_mode": weight_mode,
+            "weight_cap": weight_cap,
+            "density_aware": density_aware,
+            "pad_id": int(pad_id),
+            "max_len": max_len,
+            "min_prompt": min_prompt,
         }
-        out_path = Path(args.save_dir) / f"model_{int(time.time())}.pt"
-        torch.save(ckpt, out_path)
-        print(f"Saved RM head to {out_path}")
+    }
+    out_path = Path(save_dir) / f"model_{int(time.time())}.pt"
+    torch.save(ckpt, out_path)
+    print0(f"✓ Saved RM head to {out_path}")
 
-    if dist_is_init():
-        barrier()
-
-
-if __name__ == "__main__":
-    main()
+wandb_run.finish()
+compute_cleanup()
