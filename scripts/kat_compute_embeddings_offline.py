@@ -11,7 +11,7 @@ Usage:
     python -m scripts.kat_compute_embeddings_offline --base_model_source base --k 10 --batch_size 16
 
 Output files (in output_dir):
-    - embeddings.npy          (28k x 50304 float32 array)
+    - embeddings.npy          (28k x 768 float32 array)
     - embeddings_metadata.json (statistics and parameters)
     - density_weights.npy      (28k float32 array of density weights)
     - prompts_list.json        (list of prompts in same order as embeddings)
@@ -56,7 +56,7 @@ def load_prompts(prompts_path):
 
 def compute_embeddings(prompts, base_model, tokenizer, device, batch_size=8):
     """
-    Compute embeddings for all prompts using the base model.
+    Compute embeddings for all prompts using the base model's hidden states.
     
     Args:
         prompts: List of prompt strings
@@ -66,7 +66,7 @@ def compute_embeddings(prompts, base_model, tokenizer, device, batch_size=8):
         batch_size: Number of prompts per batch
     
     Returns:
-        embeddings: (n_prompts, vocab_size) float32 numpy array
+        embeddings: (n_prompts, n_embd) float32 numpy array (dense semantic embeddings, ~768 dims)
     """
     print(f"Computing embeddings for {len(prompts)} prompts...")
     print(f"  Batch size: {batch_size}")
@@ -103,22 +103,23 @@ def compute_embeddings(prompts, base_model, tokenizer, device, batch_size=8):
             
             input_tensor = torch.tensor(input_ids, dtype=torch.long, device=device)
             
-            # Forward pass - get logits
+            # Forward pass - get hidden states (not logits)
             try:
-                outputs = base_model(input_tensor)  # [batch, seq_len, vocab_size]
+                outputs = base_model(input_tensor, return_hidden_states=True)  # returns dict with 'hidden_states'
             except Exception as e:
                 print(f"⚠️  Error in forward pass for batch starting at {batch_idx}: {e}")
                 continue
             
-            # Average pool over sequence dimension
-            batch_emb = outputs.mean(dim=1)  # [batch, vocab_size]
+            # Extract hidden states and average pool over sequence dimension
+            hidden_states = outputs['hidden_states']  # [batch, seq_len, n_embd]
+            batch_emb = hidden_states.mean(dim=1)  # [batch, n_embd]
             embeddings.append(batch_emb.cpu().numpy())
     
     # Concatenate all batches
     if not embeddings:
         raise RuntimeError("No embeddings computed! Check input data and model.")
     
-    embeddings = np.concatenate(embeddings, axis=0)  # [n_prompts, vocab_size]
+    embeddings = np.concatenate(embeddings, axis=0)  # [n_prompts, n_embd]
     
     # L2 normalize to unit vectors
     embeddings = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
