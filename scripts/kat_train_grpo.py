@@ -1,446 +1,341 @@
 #!/usr/bin/env python3
 """
-Train with GRPO (Generalized Reward Policy Optimization) with uniform sampling.
+GRPO training with a clean RM interface.
 
-This script:
-1. Loads SFT checkpoint as the policy via checkpoint_manager
-2. Loads trained RM checkpoint for reward scoring (which may be density-aware)
-3. Samples preference pairs with UNIFORM sampling (no density weighting here)
-4. Optimizes policy using GRPO loss with KL divergence penalty
-5. Tests hypothesis that density-aware RM improves policy training
+Policy gradient is driven by pairwise advantage-weighted log-prob differences
+over response tokens only; RM provides fixed rewards computed on a frozen SFT encoder.
 
-Key change: Density sampling now occurs during RM TRAINING, not GRPO.
-The policy trains on reward signals from a RM that has seen rare prompts more frequently.
+Loss per batch:
+    A = (r_c - r_r) - beta * (KL_c - KL_r)
+    L = - A * ( logp_c - logp_r )
 
-This allows us to compare:
-- Baseline RM (uniform sampling) -> GRPO (uniform sampling)
-- Density-aware RM -> GRPO (uniform sampling)
-- GRPO with density sampling (original approach, for comparison)
-
-Usage:
-  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo
-  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --rm_source rm --max_steps=5000
-  torchrun --standalone --nproc_per_node=8 -m scripts.kat_train_grpo -- --rm_source rm_density --beta=0.1
+Contracts (required) match kat_train_rm.py:
+- SFT model forward returns dict with 'logits':[B,T,V], 'hidden_states':[B,T,H]
+- RewardHead maps last hidden [B,H] -> [B]
 """
 
-import argparse
-import json
-import os
-import sys
-from pathlib import Path
-
-import numpy as np
+from __future__ import annotations
+import argparse, json, os, sys
+from typing import List, Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.neighbors import NearestNeighbors
 
 from nanochat.checkpoint_manager import load_model, get_base_dir
 from nanochat.tokenizer import get_tokenizer
 
-
-class DensityAwareSampler:
-    """Compute local density of prompts using base model embeddings."""
-    
-    def __init__(self, prompts, base_model, tokenizer, device, k=10):
-        """
-        Args:
-            prompts: List of prompt strings
-            base_model: Base model to extract embeddings from
-            tokenizer: Tokenizer for encoding
-            device: Device to run on
-            k: Number of nearest neighbors for density estimation
-        """
-        self.prompts = prompts
-        self.k = k
-        self.base_model = base_model
-        self.tokenizer = tokenizer
-        self.device = device
-        
-        # Compute real semantic embeddings from base model
-        self.embeddings = self._compute_embeddings_from_model(prompts)
-        self.density_weights = self._compute_inverse_density_weights()
-    
-    @torch.no_grad()
-    def _compute_embeddings_from_model(self, prompts):
-        """
-        Extract embeddings from base model's hidden states.
-        Uses the penultimate layer output as semantic representation.
-        """
-        embeddings = []
-        batch_size = 8
-        
-        print(f"Computing embeddings for {len(prompts)} prompts using base model...")
-        
-        for i in range(0, len(prompts), batch_size):
-            batch_prompts = prompts[i:i+batch_size]
-            
-            # Encode prompts
-            encoded = [self.tokenizer.encode(p) for p in batch_prompts]
-            
-            # Pad to same length
-            max_len = max(len(e) for e in encoded)
-            pad_token_id = self.tokenizer.encode_special("<|assistant_end|>")
-            
-            input_ids = []
-            for e in encoded:
-                padded = e + [pad_token_id] * (max_len - len(e))
-                input_ids.append(padded[:512])  # Limit to 512 tokens
-            
-            input_tensor = torch.tensor(input_ids, dtype=torch.long, device=self.device)
-            
-            # Get model outputs (will need to hook into hidden states)
-            # For now, use logits and average pool as approximation
-            outputs = self.base_model(input_tensor)
-            
-            # Average pooling over sequence dimension
-            if isinstance(outputs, torch.Tensor):
-                # Outputs are logits: (batch, seq_len, vocab_size)
-                # Use average of sequence as embedding
-                batch_emb = outputs.mean(dim=1)  # (batch, vocab_size)
-            else:
-                # If it's a tuple or has hidden_states attribute (after we modify GPT)
-                batch_emb = outputs
-            
-            embeddings.append(batch_emb.cpu().numpy())
-        
-        embeddings = np.concatenate(embeddings, axis=0)
-        
-        # Normalize embeddings
-        embeddings = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
-        
-        return embeddings
-    
-    def _compute_inverse_density_weights(self):
-        """
-        Compute local density using k-NN.
-        Weight = 1 / local_density
-        """
-        if len(self.prompts) < self.k + 1:
-            # Too few prompts, use uniform weights
-            print(f"⚠️  Only {len(self.prompts)} prompts but k={self.k}, using uniform weights")
-            return np.ones(len(self.prompts))
-        
-        print(f"Computing density weights using k={self.k}...")
-        
-        # Compute k-NN distances
-        nbrs = NearestNeighbors(n_neighbors=self.k+1)  # +1 because self is a neighbor
-        nbrs.fit(self.embeddings)
-        distances, indices = nbrs.kneighbors(self.embeddings)
-        
-        # Local density ~ average distance to k nearest neighbors
-        # We exclude the first neighbor (self) by taking distances[:, 1:]
-        local_densities = np.mean(distances[:, 1:], axis=1)
-        
-        # Avoid division by zero
-        local_densities = np.maximum(local_densities, 1e-6)
-        
-        # Weight inversely proportional to density
-        # Normalize to [0, 1] range for use as sampling weights
-        weights = 1.0 / local_densities
-        weights = weights / weights.sum()  # Normalize to valid probability distribution
-        
-        print(f"✓ Density weights computed. Min: {weights.min():.4f}, Max: {weights.max():.4f}")
-        
-        return weights
-
+# -------------------------
+# Data
+# -------------------------
 
 class PreferenceDataset(Dataset):
-    """Dataset for GRPO training with preference pairs."""
-    
-    def __init__(self, pairs_path, tokenizer, max_length=512):
-        """Load pairs from JSONL file."""
-        self.pairs = []
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        
+    def __init__(self, pairs_path: str):
         if not os.path.exists(pairs_path):
-            raise FileNotFoundError(f"Pairs file not found: {pairs_path}")
-        
-        with open(pairs_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                try:
-                    pair = json.loads(line)
-                    if all(k in pair for k in ['prompt', 'chosen', 'rejected']):
-                        self.pairs.append(pair)
-                except json.JSONDecodeError:
-                    if line_num <= 5:
-                        print(f"⚠️  Warning: Could not parse line {line_num}")
-                    continue
-        
-        if len(self.pairs) == 0:
-            raise RuntimeError(f"No valid pairs loaded from {pairs_path}")
-    
-    def __len__(self):
-        return len(self.pairs)
-    
-    def __getitem__(self, idx):
-        pair = self.pairs[idx]
-        prompt = pair['prompt']
-        chosen = pair['chosen']
-        rejected = pair['rejected']
-        
-        # Encode without max_length/truncation parameters
-        prompt_ids = self.tokenizer.encode(prompt)
-        chosen_ids = self.tokenizer.encode(chosen)
-        rejected_ids = self.tokenizer.encode(rejected)
-        
-        # Apply truncation manually
-        if len(prompt_ids) > self.max_length:
-            prompt_ids = prompt_ids[:self.max_length]
-        if len(chosen_ids) > self.max_length:
-            chosen_ids = chosen_ids[:self.max_length]
-        if len(rejected_ids) > self.max_length:
-            rejected_ids = rejected_ids[:self.max_length]
-        
+            raise FileNotFoundError(pairs_path)
+        self.rows: List[Dict[str,str]] = []
+        with open(pairs_path, "r", encoding="utf-8") as f:
+            for ln, line in enumerate(f, 1):
+                obj = json.loads(line)
+                for k in ("prompt","chosen","rejected"):
+                    if k not in obj:
+                        raise KeyError(f"Missing '{k}' on line {ln}")
+                self.rows.append({"prompt": obj["prompt"], "chosen": obj["chosen"], "rejected": obj["rejected"]})
+    def __len__(self) -> int: return len(self.rows)
+    def __getitem__(self, idx: int) -> Dict[str,str]: return self.rows[idx]
+
+# -------------------------
+# Reward head (same as RM script)
+# -------------------------
+
+class RewardHead(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, 1)
+    def forward(self, last_hidden: torch.Tensor) -> torch.Tensor:
+        assert last_hidden.dim()==2, f"last_hidden must be [B,H], got {last_hidden.shape}"
+        return self.linear(last_hidden).squeeze(-1)
+
+# -------------------------
+# Collation
+# -------------------------
+
+def _encode_concat(tokenizer, prompt: str, resp: str, pad_id: int, max_len: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      input_ids [T], attention_mask [T], response_mask [T]  (True only on response tokens)
+    Truncates from left of prompt first to preserve response.
+    """
+    p_ids = tokenizer.encode(prompt)
+    r_ids = tokenizer.encode(resp)
+    max_len = int(max_len)
+    # Keep response; shrink prompt from left
+    if len(p_ids) + len(r_ids) > max_len:
+        keep_r = min(len(r_ids), max_len // 2 if len(r_ids) > 0 else 0)
+        keep_p = max_len - keep_r
+        if keep_p < 0: keep_p = 0
+        p_ids = p_ids[-keep_p:]
+        r_ids = r_ids[: (max_len - len(p_ids))]
+
+    ids = p_ids + r_ids
+    T = len(ids)
+    attn = [1] * T
+    resp_mask = [0]*len(p_ids) + [1]*len(r_ids)
+
+    if T < max_len:
+        pad = [pad_id] * (max_len - T)
+        padm = [0] * (max_len - T)
+        ids = ids + pad
+        attn = attn + padm
+        resp_mask = resp_mask + padm
+
+    return (
+        torch.tensor(ids, dtype=torch.long),
+        torch.tensor(attn, dtype=torch.bool),
+        torch.tensor(resp_mask, dtype=torch.bool),
+    )
+
+def make_collate_grpo(tokenizer, max_len: int):
+    pad_id = tokenizer.encode_special("<|assistant_end|>")
+    def _collate(batch: List[Dict[str,str]]):
+        ci, ca, cr = [], [], []
+        ri, ra, rr = [], [], []
+        for row in batch:
+            i,a,r = _encode_concat(tokenizer, row["prompt"], row["chosen"], pad_id, max_len)
+            ci.append(i); ca.append(a); cr.append(r)
+            i,a,r = _encode_concat(tokenizer, row["prompt"], row["rejected"], pad_id, max_len)
+            ri.append(i); ra.append(a); rr.append(r)
         return {
-            'prompt_ids': torch.tensor(prompt_ids),
-            'chosen_ids': torch.tensor(chosen_ids),
-            'rejected_ids': torch.tensor(rejected_ids),
+            "chosen_input_ids": torch.stack(ci,0),  # [B,T]
+            "chosen_attn": torch.stack(ca,0),       # [B,T]
+            "chosen_resp": torch.stack(cr,0),       # [B,T]
+            "rejected_input_ids": torch.stack(ri,0),
+            "rejected_attn": torch.stack(ra,0),
+            "rejected_resp": torch.stack(rr,0),
         }
+    return _collate
 
+# -------------------------
+# Math helpers
+# -------------------------
 
-def compute_grpo_loss(policy_logits, reference_logits, rm_rewards, beta=0.1, temperature=1.0):
+def seq_logprob_over_response(logits: torch.Tensor, input_ids: torch.Tensor, resp_mask: torch.Tensor) -> torch.Tensor:
     """
-    Compute GRPO loss with proper KL divergence penalty.
-    
-    GRPO combines:
-    1. Reward maximization: maximize (r_chosen - r_rejected)
-    2. KL penalty: don't diverge too much from SFT reference
-    
-    Loss = -reward + beta * KL(policy || reference)
+    logits: [B,T,V] over tokens 0..T-1
+    We use teacher-forcing next-token log-prob:
+        use logits[:, :-1] to predict labels = input_ids[:, 1:]
+    Only sum on positions where resp_mask for the *label* token is True.
+    Returns [B] sum of token log-probs over response labels.
     """
-    chosen_reward, rejected_reward = rm_rewards
-    policy_chosen_logits, policy_rejected_logits = policy_logits
-    ref_chosen_logits, ref_rejected_logits = reference_logits
-    
-    # Preference loss: Bradley-Terry preference
-    pref_loss = -F.logsigmoid(chosen_reward - rejected_reward).mean()
-    
-    # KL divergence penalty (proper implementation)
-    # KL(policy || reference) = E[log(policy) - log(reference)]
-    
-    # Chosen response KL
-    kl_chosen = F.kl_div(
-        F.log_softmax(policy_chosen_logits / temperature, dim=-1),
-        F.softmax(ref_chosen_logits / temperature, dim=-1),
-        reduction='batchmean'
-    )
-    
-    # Rejected response KL
-    kl_rejected = F.kl_div(
-        F.log_softmax(policy_rejected_logits / temperature, dim=-1),
-        F.softmax(ref_rejected_logits / temperature, dim=-1),
-        reduction='batchmean'
-    )
-    
-    kl_loss = (kl_chosen + kl_rejected) / 2.0
-    
-    total_loss = pref_loss + beta * kl_loss
-    return total_loss, pref_loss.item(), kl_loss.item()
+    assert logits.dim()==3 and input_ids.dim()==2 and resp_mask.dim()==2
+    B,T,V = logits.shape
+    logp = F.log_softmax(logits[:, :-1, :], dim=-1)          # [B,T-1,V]
+    labels = input_ids[:, 1:]                                 # [B,T-1]
+    token_lp = logp.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)  # [B,T-1]
 
+    resp_mask_labels = resp_mask[:, 1:]                       # [B,T-1]
+    token_lp = token_lp * resp_mask_labels.float()
+    return token_lp.sum(dim=1)                                # [B]
+
+def seq_kl_over_response(pol_logits: torch.Tensor, ref_logits: torch.Tensor, resp_mask: torch.Tensor) -> torch.Tensor:
+    """
+    KL(policy || reference) per sequence, summed over response label positions.
+    """
+    assert pol_logits.shape == ref_logits.shape
+    logp = F.log_softmax(pol_logits[:, :-1, :], dim=-1)      # [B,T-1,V]
+    logq = F.log_softmax(ref_logits[:, :-1, :], dim=-1)      # [B,T-1,V]
+    p = logp.exp()
+    kl_tok = (p * (logp - logq)).sum(dim=-1)                 # [B,T-1]
+    resp_mask_labels = resp_mask[:, 1:]                      # [B,T-1]
+    kl_tok = kl_tok * resp_mask_labels.float()
+    return kl_tok.sum(dim=1)                                 # [B]
+
+def last_nonpad_hidden(hidden: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+    assert hidden.dim()==3 and attn.dim()==2
+    B,T,H = hidden.shape
+    idx = attn.long().sum(dim=1).clamp(min=1) - 1            # [B]
+    batch = torch.arange(B, device=hidden.device)
+    return hidden[batch, idx, :]                             # [B,H]
+
+# -------------------------
+# Load RM head ckpt
+# -------------------------
+
+def load_rm_head(ckpt_dir: str, hidden_size: int, device: torch.device) -> RewardHead:
+    path = os.path.join(ckpt_dir, "model_000000.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"RM checkpoint not found: {path}")
+    data = torch.load(path, map_location="cpu")
+    sd = data.get("rm_head_state_dict", None)
+    if sd is None:
+        # backward compat
+        sd = data.get("model_state_dict", None)
+    if sd is None:
+        raise KeyError(f"'rm_head_state_dict' not found in {path}")
+    head = RewardHead(hidden_size)
+    head.load_state_dict(sd)
+    return head.to(device)
+
+# -------------------------
+# Main
+# -------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train with GRPO (Generalized Reward Policy Optimization)")
-    
-    # Paths
+    parser = argparse.ArgumentParser(description="GRPO training with clean RM usage")
     default_pairs = os.path.join(get_base_dir(), "data", "pairs_all.jsonl")
-    default_prompts = os.path.join(get_base_dir(), "data", "prompts_all.jsonl")
-    
-    parser.add_argument("--pairs_path", default=default_pairs, help="Path to pairs")
-    parser.add_argument("--prompts_path", default=default_prompts, help="Path to prompts")
-    parser.add_argument("--sft_source", default="sft", help="Source for SFT model (sft|mid|base)")
-    parser.add_argument("--rm_source", default="rm", help="Source for RM model (rm|rm_density)")
-    parser.add_argument("--grpo_source", default="grpo", help="Source name for GRPO output (grpo|grpo_density)")
-    parser.add_argument("--out_dir", default=None, help="Output directory (overrides grpo_source if provided)")
-    
-    # Training params
-    parser.add_argument("--max_steps", type=int, default=5000, help="Max training steps")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
-    parser.add_argument("--beta", type=float, default=0.1, help="KL divergence penalty")
-    parser.add_argument("--device_batch_size", type=int, default=8, help="Batch size per device")
-    parser.add_argument("--log_interval", type=int, default=100, help="Log interval")
+    parser.add_argument("--pairs_path", default=default_pairs)
+    parser.add_argument("--sft_source", default="sft")            # policy + reference init
+    parser.add_argument("--rm_source", default="rm")              # selects RM ckpt dir
+    parser.add_argument("--grpo_source", default="grpo")          # selects output dir layout
+    parser.add_argument("--out_dir", default=None)
+
+    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--beta", type=float, default=0.1)        # KL penalty coefficient
+    parser.add_argument("--device_batch_size", type=int, default=8)
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--max_seq_len", type=int, default=512)
     args = parser.parse_args()
-    
-    # Determine output directory from grpo_source if not explicitly provided
+
+    # Resolve dirs
     if args.out_dir is None:
-        source_to_dir = {
+        mapping = {
             "grpo": os.path.join(get_base_dir(), "grpo_checkpoints", "uniform", "d20"),
             "grpo_density": os.path.join(get_base_dir(), "grpo_checkpoints", "density", "d20"),
         }
-        if args.grpo_source not in source_to_dir:
-            raise ValueError(f"Unknown grpo_source: {args.grpo_source}. Must be one of: {list(source_to_dir.keys())}")
-        args.out_dir = source_to_dir[args.grpo_source]
-    
-    # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if args.grpo_source not in mapping:
+            raise ValueError(f"Unknown grpo_source: {args.grpo_source}")
+        args.out_dir = mapping[args.grpo_source]
     os.makedirs(args.out_dir, exist_ok=True)
-    
-    print("="*70)
-    print(f"GRPO Training (RM source: {args.rm_source}, Output: {args.grpo_source})")
-    print("="*70)
-    
-    # Load SFT checkpoint as policy
-    print(f"\nLoading policy from {args.sft_source}...")
-    try:
-        policy, tokenizer, sft_meta = load_model(
-            source=args.sft_source,
-            device=device,
-            phase="train"
-        )
-        print(f"✓ Policy loaded")
-    except Exception as e:
-        print(f"Error loading policy: {e}")
-        sys.exit(1)
-    
-    # Load SFT checkpoint again as reference (frozen)
-    print(f"Loading reference model (frozen)...")
-    try:
-        reference_model, _, _ = load_model(
-            source=args.sft_source,
-            device=device,
-            phase="eval"
-        )
-        reference_model.eval()
-        for param in reference_model.parameters():
-            param.requires_grad = False
-        print(f"✓ Reference model loaded")
-    except Exception as e:
-        print(f"Error loading reference model: {e}")
-        sys.exit(1)
-    
-    # Load RM checkpoint
-    print(f"Loading RM from {args.rm_source}...")
-    try:
-        # Load RM from source via checkpoint_manager
-        rm_model, _, rm_meta = load_model(
-            source=args.rm_source,
-            device=device,
-            phase="eval"
-        )
-        rm_head = rm_model
-        rm_head.eval()
-        print(f"✓ RM loaded")
-    except Exception as e:
-        print(f"Error loading RM from {args.rm_source}: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # Load dataset
-    print(f"Loading preference pairs from {args.pairs_path}...")
-    try:
-        if not os.path.exists(args.pairs_path):
-            raise FileNotFoundError(f"Pairs file not found. Run kat_download_pairs first.")
-        
-        dataset = PreferenceDataset(args.pairs_path, tokenizer=tokenizer)
-        print(f"✓ Loaded {len(dataset)} pairs")
-    except Exception as e:
-        print(f"Error loading dataset: {e}")
-        sys.exit(1)
-    
-    # Create dataloader with uniform sampling
-    # NOTE: Density sampling now happens during RM training, not GRPO
-    print(f"\n{'='*70}")
-    print("GRPO uses UNIFORM sampling")
-    print("(Density sampling moved to RM training stage)")
-    print(f"{'='*70}")
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.device_batch_size,
-        shuffle=True,
-    )
-    
-    # Setup optimization
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load tokenizer + models
+    # Policy (trainable)
+    policy, tokenizer, _ = load_model(source=args.sft_source, device=device, phase="train")
+    # Reference (frozen)
+    reference, _, _ = load_model(source=args.sft_source, device=device, phase="eval")
+    reference.eval()
+    for p in reference.parameters(): p.requires_grad_(False)
+    # Frozen encoder for RM (use the same SFT backbone as RM training)
+    rm_encoder, _, _ = load_model(source=args.sft_source, device=device, phase="eval")
+    rm_encoder.eval()
+    for p in rm_encoder.parameters(): p.requires_grad_(False)
+
+    hidden_size = getattr(getattr(policy, "config", None), "n_embd", None)
+    if hidden_size is None:
+        raise RuntimeError("policy.config.n_embd not found")
+
+    # RM head
+    rm_ckpt_dir = {
+        "rm": os.path.join(get_base_dir(), "rm_checkpoints", "uniform", "d20"),
+        "rm_density": os.path.join(get_base_dir(), "rm_checkpoints", "density", "d20"),
+    }.get(args.rm_source, None)
+    if rm_ckpt_dir is None:
+        raise ValueError(f"Unknown rm_source: {args.rm_source}")
+    rm_head = load_rm_head(rm_ckpt_dir, hidden_size=hidden_size, device=device)
+    rm_head.eval()
+    for p in rm_head.parameters(): p.requires_grad_(False)
+
+    # Data
+    dataset = PreferenceDataset(args.pairs_path)
+    collate = make_collate_grpo(tokenizer, args.max_seq_len)
+    loader = DataLoader(dataset,
+                        batch_size=args.device_batch_size,
+                        shuffle=True,
+                        num_workers=0,
+                        collate_fn=collate)
+
+    # Optimizer / scheduler
     optimizer = torch.optim.AdamW(policy.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_steps)
-    
     writer = SummaryWriter(log_dir=os.path.join(args.out_dir, "logs"))
-    
-    # Training loop
-    print("\n" + "="*70)
-    print(f"Starting GRPO Training")
-    print("="*70)
-    
-    policy.train()
-    reference_model.eval()
-    rm_head.eval()
-    
-    step = 0
-    for epoch in range(100):
-        for batch_idx, batch in enumerate(dataloader):
-            if step >= args.max_steps:
-                break
-            
-            try:
-                # Move to device
-                chosen_ids = batch['chosen_ids'].to(device)
-                rejected_ids = batch['rejected_ids'].to(device)
-                
-                # Forward pass through policy
-                chosen_logits = policy(chosen_ids)
-                rejected_logits = policy(rejected_ids)
-                
-                # Forward pass through reference model (frozen)
-                with torch.no_grad():
-                    ref_chosen_logits = reference_model(chosen_ids)
-                    ref_rejected_logits = reference_model(rejected_ids)
-                
-                # Get rewards from RM (simplified - just use logits as reward proxy for now)
-                with torch.no_grad():
-                    chosen_reward = rm_head(chosen_logits) if callable(rm_head) else chosen_logits.mean(dim=1)
-                    rejected_reward = rm_head(rejected_logits) if callable(rm_head) else rejected_logits.mean(dim=1)
-                
-                # Compute loss
-                loss, pref_loss_val, kl_loss_val = compute_grpo_loss(
-                    (chosen_logits, rejected_logits),
-                    (ref_chosen_logits, ref_rejected_logits),
-                    (chosen_reward, rejected_reward),
-                    beta=args.beta
-                )
-                
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                
-                if step % args.log_interval == 0:
-                    print(f"Step {step}/{args.max_steps} | Loss: {loss:.4f} | Pref: {pref_loss_val:.4f} | KL: {kl_loss_val:.4f}")
-                    writer.add_scalar("train/loss", loss, step)
-                    writer.add_scalar("train/pref_loss", pref_loss_val, step)
-                    writer.add_scalar("train/kl_loss", kl_loss_val, step)
-                    writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
-                
-                step += 1
-            except Exception as e:
-                print(f"Error in training step: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-        
-        if step >= args.max_steps:
-            break
-    
-    # Save checkpoint
-    print(f"\nSaving GRPO checkpoint to: {args.out_dir}")
-    checkpoint_path = os.path.join(args.out_dir, "model_000000.pt")
-    torch.save({
-        'model_state_dict': policy.state_dict(),
-        'config': {
-            'density_aware': False, # No longer density-aware
-            'beta': args.beta,
-            'training_steps': step,
-        }
-    }, checkpoint_path)
-    print(f"✓ Saved to {checkpoint_path}")
-    
-    writer.close()
-    print("✓ GRPO training complete!")
 
+    step = 0
+    policy.train()
+    reference.eval()
+    rm_encoder.eval()
+
+    while step < args.max_steps:
+        for batch in loader:
+            if step >= args.max_steps: break
+
+            # Move to device
+            ci = batch["chosen_input_ids"].to(device)
+            ca = batch["chosen_attn"].to(device)
+            cr = batch["chosen_resp"].to(device)
+
+            ri = batch["rejected_input_ids"].to(device)
+            ra = batch["rejected_attn"].to(device)
+            rr = batch["rejected_resp"].to(device)
+
+            # Forward policy + reference (for LL and KL, response tokens only)
+            out_pc = policy(input_ids=ci, attention_mask=ca, return_hidden_states=True)
+            out_pr = policy(input_ids=ri, attention_mask=ra, return_hidden_states=True)
+            out_rc = reference(input_ids=ci, attention_mask=ca, return_hidden_states=True)
+            out_rr = reference(input_ids=ri, attention_mask=ra, return_hidden_states=True)
+
+            # Strict contract checks (fail fast with clear messages)
+            for name, out in (("policy:chosen", out_pc), ("policy:rejected", out_pr),
+                              ("ref:chosen", out_rc), ("ref:rejected", out_rr)):
+                assert isinstance(out, dict), f"{name}: model must return dict"
+                assert "logits" in out, f"{name}: missing logits"
+                assert out["logits"].dim()==3, f"{name}: logits must be [B,T,V], got {out['logits'].shape}"
+
+            # Log-prob sums over response labels
+            logp_c = seq_logprob_over_response(out_pc["logits"], ci, cr)  # [B]
+            logp_r = seq_logprob_over_response(out_pr["logits"], ri, rr)  # [B]
+
+            # KL sums over response labels
+            kl_c = seq_kl_over_response(out_pc["logits"], out_rc["logits"], cr)  # [B]
+            kl_r = seq_kl_over_response(out_pr["logits"], out_rr["logits"], rr)  # [B]
+
+            # Rewards from RM (frozen encoder + frozen head), computed on FULL sequences
+            with torch.no_grad():
+                enc_c = rm_encoder(input_ids=ci, attention_mask=ca, return_hidden_states=True)
+                enc_r = rm_encoder(input_ids=ri, attention_mask=ra, return_hidden_states=True)
+                for name, out in (("rm:chosen", enc_c), ("rm:rejected", enc_r)):
+                    assert isinstance(out, dict) and "hidden_states" in out and out["hidden_states"].dim()==3, \
+                        f"{name}: need hidden_states [B,T,H]"
+                last_c = last_nonpad_hidden(enc_c["hidden_states"], ca)   # [B,H]
+                last_r = last_nonpad_hidden(enc_r["hidden_states"], ra)   # [B,H]
+                r_c = rm_head(last_c)  # [B]
+                r_r = rm_head(last_r)  # [B]
+
+            # Pairwise advantage and GRPO loss
+            A = (r_c - r_r) - args.beta * (kl_c - kl_r)                    # [B]
+            loss = -(A * (logp_c - logp_r)).mean()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            if step % args.log_interval == 0:
+                with torch.no_grad():
+                    pref_margin = (r_c - r_r).mean().item()
+                    kl_margin = (kl_c - kl_r).mean().item()
+                    lp_margin = (logp_c - logp_r).mean().item()
+                writer.add_scalar("train/loss", float(loss.item()), step)
+                writer.add_scalar("train/reward_margin", pref_margin, step)
+                writer.add_scalar("train/kl_margin", kl_margin, step)
+                writer.add_scalar("train/logprob_margin", lp_margin, step)
+                writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
+                print(f"[GRPO] step {step}/{args.max_steps}  loss={loss.item():.4f}  "
+                      f"Δr={pref_margin:.4f}  ΔKL={kl_margin:.4f}  Δlogp={lp_margin:.4f}")
+
+            step += 1
+
+    # Save policy checkpoint
+    ckpt_path = os.path.join(args.out_dir, "model_000000.pt")
+    torch.save({
+        "model_state_dict": policy.state_dict(),
+        "config": {"beta": args.beta, "training_steps": step}
+    }, ckpt_path)
+    print(f"✓ Saved GRPO policy to {ckpt_path}")
+    writer.close()
 
 if __name__ == "__main__":
     main()
