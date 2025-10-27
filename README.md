@@ -48,8 +48,13 @@ bash kat_speedrun.sh
 sudo apt-get update -y && sudo apt-get install -y git python3-venv screen
 git clone https://github.com/tablekat/nanochat-rlhf-density-sampling.git
 screen -S speedrun
+cd nanochat-rlhf-density-sampling/
 bash runpod.sh
+source .venv/bin/activate
+export NANOCHAT_BASE_DIR=/workspace/nanochat
 bash kat_speedrun.sh
+
+# fucking wandb: https://wandb.ai/authorize
 ```
 
 # Original readme!
