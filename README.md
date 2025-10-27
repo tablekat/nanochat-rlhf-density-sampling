@@ -44,6 +44,14 @@ bash kat_speedrun.sh
 # detach: Ctrl-A then D; reattach: screen -r speedrun
 ```
 
+```
+sudo apt-get update -y && sudo apt-get install -y git python3-venv screen
+git clone https://github.com/tablekat/nanochat-rlhf-density-sampling.git
+screen -S speedrun
+bash runpod.sh
+bash kat_speedrun.sh
+```
+
 # Original readme!
 
 ![nanochat logo](dev/nanochat.png)
