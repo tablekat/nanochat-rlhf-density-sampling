@@ -139,6 +139,7 @@ class KVCache:
             additional_shape[4] = t_needed - self.kv_cache.size(4)
             additional_cache = torch.empty(additional_shape, dtype=k.dtype, device=k.device)
             self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()
+            self.kv_shape = self.kv_cache.shape
         # Insert k, v into the cache
         self.kv_cache[layer_idx, 0, :, :, t0:t1] = k
         self.kv_cache[layer_idx, 1, :, :, t0:t1] = v
