@@ -34,14 +34,14 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.distributed import is_initialized as dist_is_init, get_rank as dist_rank, get_world_size as dist_ws, init_process_group, barrier
 from tqdm import tqdm
 
+# Use nanochat library functions
+from nanochat.common import get_base_dir as nc_get_base_dir
+from nanochat.checkpoint_manager import load_model as nc_load_model
+
 
 # -------------------
 # Paths & utilities
 # -------------------
-
-def get_base_dir() -> Path:
-    # mirrors the doc you wrote; overridable via env
-    return Path(os.environ.get("NANOCHAT_HOME", "~/.cache/nanochat")).expanduser()
 
 def md5_16(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:16]
@@ -116,30 +116,18 @@ class TokenizerWrapper:
 def build_backbone(device: torch.device, dtype: torch.dtype):
     """
     Create the frozen SFT backbone used to extract features for RM.
-
-    By default we try to import the nanochat Transformer checkpoint loader.
-    If your loader utility has a different name, adjust here.
-
-    Expected forward: logits = model(input_ids) -> (B,T,V)
+    Uses nanochat checkpoint_manager for proper model loading.
     """
-    # Try to import a canonical nanochat model builder if available
-    model = None
     try:
-        # THE FOLLOWING IS A SOFT HOOK: adapt to your repo if needed.
-        # E.g., from nanochat.engine import build_sft_backbone
-        # model = build_sft_backbone().to(device=device, dtype=dtype).eval()
-        from nanochat.tasks.infer import load_model  # common in nanochat forks
-        model = load_model("sft")  # or "base" depending on your tree
+        # Use proper nanochat loader with source="sft"
+        model, tokenizer_unused, _ = nc_load_model(source="sft", device=device, phase="eval")
         model = model.to(device=device, dtype=dtype).eval()
-    except Exception:
-        pass
-
-    if model is None:
+    except Exception as e:
         raise RuntimeError(
-            "Couldn't import a nanochat backbone. Replace build_backbone() body with "
-            "your local loader that returns a (B,T,V) logits model in eval mode."
+            f"Failed to load SFT model from nanochat checkpoints: {e}\n"
+            f"Ensure chatsft_checkpoints/d20/model_*.pt exists."
         )
-
+    
     for p in model.parameters():
         p.requires_grad_(False)
     return model
@@ -347,11 +335,20 @@ def apply_weights(loss_per_ex: torch.Tensor, w: torch.Tensor, mode: str, cap: Op
 
 def main():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    base = get_base_dir()
-    p.add_argument("--pairs_path", type=str, default=str(base / "data" / "pairs_all.jsonl"))
-    p.add_argument("--prompts_path", type=str, default=str(base / "data" / "prompts_all.jsonl"))
-    p.add_argument("--density_weights_path", type=str, default=str(base / "data" / "embeddings_offline" / "density_weights.npy"))
-    p.add_argument("--density_aware", action="store_true", help="if set, load density weights and apply as loss weights")
+    base = nc_get_base_dir()
+    
+    # Mapping for rm_source parameter
+    save_dir_mapping = {
+        "rm": os.path.join(base, "rm_checkpoints", "uniform", "d20"),
+        "rm_density": os.path.join(base, "rm_checkpoints", "density", "d20"),
+    }
+    
+    p.add_argument("--rm_source", type=str, default="rm", 
+                   choices=["rm", "rm_density"],
+                   help="determines output directory and whether to load density weights")
+    p.add_argument("--pairs_path", type=str, default=str(Path(base) / "data" / "pairs_all.jsonl"))
+    p.add_argument("--prompts_path", type=str, default=str(Path(base) / "data" / "prompts_all.jsonl"))
+    p.add_argument("--density_weights_path", type=str, default=str(Path(base) / "data" / "embeddings_offline" / "density_weights.npy"))
     p.add_argument("--weight_mode", type=str, choices=["mean","sum","none"], default="mean",
                    help="how to normalize per-example weights inside the loss")
     p.add_argument("--weight_cap", type=float, default=None, help="optional upper clip for per-example weights")
@@ -366,9 +363,12 @@ def main():
     p.add_argument("--wd", type=float, default=0.0)
     p.add_argument("--max_steps", type=int, default=1000)
     p.add_argument("--log_every", type=int, default=25)
-    p.add_argument("--save_dir", type=str, default=str(base / "rm_checkpoints" / "d20"))
     args = p.parse_args()
 
+    # Resolve output directory from rm_source and auto-enable density_aware if needed
+    args.save_dir = save_dir_mapping[args.rm_source]
+    density_aware_auto = args.rm_source == "rm_density"
+    
     setup_ddp_if_needed()
     device = torch.device(args.device)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
@@ -378,7 +378,7 @@ def main():
 
     # density map (prompt_id -> weight)
     density = None
-    if args.density_aware:
+    if density_aware_auto:
         density = load_density_mapping(Path(args.prompts_path), Path(args.density_weights_path))
 
     # dataset & loader
@@ -399,7 +399,7 @@ def main():
 
     if is_main_process():
         os.makedirs(args.save_dir, exist_ok=True)
-        print(f"RM training: {len(ds)} pairs | density_aware={args.density_aware} weight_mode={args.weight_mode}")
+        print(f"RM training: {len(ds)} pairs | source={args.rm_source} | density_aware={density_aware_auto} weight_mode={args.weight_mode}")
 
     step = 0
     t0 = time.time()
@@ -446,7 +446,7 @@ def main():
                 "features_dim": feats.size(-1),
                 "weight_mode": args.weight_mode,
                 "weight_cap": args.weight_cap,
-                "density_aware": args.density_aware,
+                "density_aware": density_aware_auto,
                 "tokenizer_kind": tok.kind,
                 "pad_id": int(tok.pad_id),
                 "max_len": args.max_len,

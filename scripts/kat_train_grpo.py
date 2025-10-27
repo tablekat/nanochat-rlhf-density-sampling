@@ -23,6 +23,10 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torch.distributed import is_initialized as dist_is_init, get_rank as dist_rank, init_process_group, barrier
 from tqdm import tqdm
 
+# Use nanochat library functions
+from nanochat.common import get_base_dir as nc_get_base_dir
+from nanochat.checkpoint_manager import load_model as nc_load_model
+
 
 # -------------
 # utils
@@ -38,9 +42,6 @@ def setup_ddp_if_needed():
     if "RANK" in os.environ and not dist_is_init():
         init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-
-def get_base_dir() -> Path:
-    return Path(os.environ.get("NANOCHAT_HOME", "~/.cache/nanochat")).expanduser()
 
 
 # -------------
@@ -83,17 +84,14 @@ class TokenizerWrapper:
 
 def load_backbone(tag: str, device, dtype):
     """
-    Build the policy or reference model from your nanochat checkpoint utility.
-    Replace body with your local loader if needed. Must return logits (B,T,V).
+    Build the policy or reference model from nanochat checkpoint utility.
     """
-    model = None
     try:
-        from nanochat.tasks.infer import load_model
-        model = load_model(tag)  # e.g., "sft"
+        model, _, _ = nc_load_model(source=tag, device=device, phase="eval")
         model = model.to(device=device, dtype=dtype).eval()
-    except Exception:
-        raise RuntimeError("Replace load_backbone() with your local model loader.")
-    return model
+        return model
+    except Exception as e:
+        raise RuntimeError(f"Failed to load backbone with source={tag}: {e}\nEnsure checkpoints exist.")
 
 
 class RewardHead(nn.Module):
@@ -207,9 +205,25 @@ def collate(rows: List[PairRow], tok: TokenizerWrapper, max_len: int, min_prompt
 
 def main():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    base = get_base_dir()
-    p.add_argument("--pairs_path", type=str, default=str(base / "data" / "pairs_all.jsonl"))
-    p.add_argument("--rm_head_ckpt", type=str, required=True, help="path saved by kat_train_rm.py")
+    base = nc_get_base_dir()
+    
+    # Mappings for source parameters
+    rm_ckpt_mapping = {
+        "rm": os.path.join(base, "rm_checkpoints", "uniform", "d20"),
+        "rm_density": os.path.join(base, "rm_checkpoints", "density", "d20"),
+    }
+    grpo_out_mapping = {
+        "grpo": os.path.join(base, "grpo_checkpoints", "uniform", "d20"),
+        "grpo_density": os.path.join(base, "grpo_checkpoints", "density", "d20"),
+    }
+    
+    p.add_argument("--rm_source", type=str, default="rm",
+                   choices=["rm", "rm_density"],
+                   help="selects which RM checkpoint to load (uniform or density-aware)")
+    p.add_argument("--grpo_source", type=str, default="grpo",
+                   choices=["grpo", "grpo_density"],
+                   help="determines output directory for GRPO policy")
+    p.add_argument("--pairs_path", type=str, default=str(Path(base) / "data" / "pairs_all.jsonl"))
     p.add_argument("--tokenizer_path", type=str, default="tokenizer.model")
     p.add_argument("--hf_fallback", type=str, default=None)
     p.add_argument("--device", type=str, default="cuda")
@@ -226,8 +240,11 @@ def main():
     p.add_argument("--std_adv", action="store_true", help="standardize (rc-rr) per batch to stabilize")
     p.add_argument("--max_steps", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=25)
-    p.add_argument("--save_dir", type=str, default=str(base / "grpo_checkpoints" / "d20"))
     args = p.parse_args()
+    
+    # Auto-resolve paths from source parameters
+    args.rm_head_ckpt_dir = rm_ckpt_mapping[args.rm_source]
+    args.save_dir = grpo_out_mapping[args.grpo_source]
 
     setup_ddp_if_needed()
     device = torch.device(args.device)
@@ -246,8 +263,14 @@ def main():
     reference = load_backbone("sft", device, dtype).eval() # ref frozen
     for p in reference.parameters(): p.requires_grad_(False)
 
-    # RM head
-    rm = torch.load(args.rm_head_ckpt, map_location="cpu")
+    # RM head - auto-find latest checkpoint in the RM source directory
+    import glob
+    rm_ckpt_files = glob.glob(os.path.join(args.rm_head_ckpt_dir, "model_*.pt"))
+    if not rm_ckpt_files:
+        raise FileNotFoundError(f"No RM checkpoint found in {args.rm_head_ckpt_dir}")
+    rm_head_path = max(rm_ckpt_files, key=lambda x: int(Path(x).stem.split("_")[1]))
+    
+    rm = torch.load(rm_head_path, map_location="cpu")
     head = RewardHead(in_dim=rm["meta"]["features_dim"]).to(device=device, dtype=dtype)
     head.load_state_dict(rm["rm_head_state_dict"])
     for p_ in head.parameters(): p_.requires_grad_(False)
@@ -259,7 +282,8 @@ def main():
 
     if is_main():
         os.makedirs(args.save_dir, exist_ok=True)
-        print(f"GRPO: {len(ds)} pairs | target_kl={args.target_kl} | std_adv={args.std_adv}")
+        print(f"GRPO: {len(ds)} pairs | rm_source={args.rm_source} | grpo_source={args.grpo_source} | "
+              f"target_kl={args.target_kl} | std_adv={args.std_adv}")
 
     step = 0
     t0 = time.time()
