@@ -179,12 +179,16 @@ def make_batch(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, de
 
 @torch.no_grad()
 def extract_features(backbone, x: torch.Tensor, pad_id: int) -> torch.Tensor:
-    """Extract last-token logits as features."""
-    logits = backbone(x)
-    mask = (x != pad_id).to(x.dtype)
-    lengths = mask.sum(dim=1).clamp(min=1)
-    idx = (lengths - 1).long()
-    return logits[torch.arange(x.size(0), device=x.device), idx]
+    """
+    Extract last non-pad HIDDEN STATE as features: [B, H].
+    Assumes backbone(..., return_hidden_states=True) returns {'hidden_states': [B,T,H]}.
+    """
+    attn = (x != pad_id)
+    out = backbone(x, return_hidden_states=True)
+    H = out["hidden_states"]            # [B,T,H]
+    idx = attn.long().sum(dim=1).clamp(min=1) - 1
+    b = torch.arange(x.size(0), device=x.device)
+    return H[b, idx, :]                 # [B,H]
 
 def bt_loss(reward_ch: torch.Tensor, reward_rj: torch.Tensor) -> torch.Tensor:
     """Bradley–Terry pairwise loss."""
@@ -228,8 +232,7 @@ for p in backbone.parameters():
     p.requires_grad_(False)
 
 hidden_size = getattr(getattr(backbone, "config", None), "n_embd", None)
-if hidden_size is None:
-    raise RuntimeError("model.config.n_embd not found")
+assert hidden_size is not None, "model.config.n_embd not found"
 
 pad_id = tokenizer.encode_special("<|assistant_end|>")
 
@@ -313,7 +316,7 @@ if master_process:
     ckpt = {
         "rm_head_state_dict": head.state_dict(),
         "meta": {
-            "features_dim": hidden_size,
+            "features_dim": hidden_size,  # <-- matches hidden states
             "weight_mode": weight_mode,
             "weight_cap": weight_cap,
             "density_aware": density_aware,

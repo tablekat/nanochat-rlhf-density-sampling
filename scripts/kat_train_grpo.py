@@ -169,11 +169,13 @@ def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, devic
 
 @torch.no_grad()
 def last_features(backbone, x: torch.Tensor, pad_id: int) -> torch.Tensor:
-    """Extract last-token logits as features."""
-    logits = backbone(x)
-    mask = (x != pad_id).to(x.dtype)
-    idx = (mask.sum(dim=1).clamp(min=1) - 1).long()
-    return logits[torch.arange(x.size(0), device=x.device), idx]
+    """Extract last non-pad hidden state [B,H] as RM features."""
+    attn = (x != pad_id)
+    out = backbone(x, return_hidden_states=True)
+    H = out["hidden_states"]            # [B,T,H]
+    idx = attn.long().sum(dim=1).clamp(min=1) - 1
+    b = torch.arange(x.size(0), device=x.device)
+    return H[b, idx, :]                 # [B,H]
 
 def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum log-probs over response tokens (teacher forcing)."""
@@ -186,21 +188,16 @@ def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return (gathered * mask).sum(dim=1)
 
 def sum_kl(policy, reference, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Sum KL(policy || reference) over response tokens."""
+    """True KL(policy || reference) over response tokens (sum over vocab)."""
     with torch.no_grad():
         ref_logits = reference(x)
-        ref_logp = ref_logits.log_softmax(dim=-1)
-    
     pol_logits = policy(x)
-    pol_logp = pol_logits.log_softmax(dim=-1)
-    
-    tgt = labels[:, 1:].contiguous()
-    pol_logp = pol_logp[:, :-1].contiguous()
-    ref_logp = ref_logp[:, :-1].contiguous()
-    mask = (tgt != -100)
-    
-    kl_token = (pol_logp - ref_logp).gather(2, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-    return (kl_token * mask).sum(dim=1)
+    logp = F.log_softmax(pol_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
+    logq = F.log_softmax(ref_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
+    p = logp.exp()
+    kl_tok = (p * (logp - logq)).sum(dim=-1)             # [B,T-1]
+    resp_mask = (labels[:, 1:] != -100).float()          # [B,T-1]
+    return (kl_tok * resp_mask).sum(dim=1)               # [B]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Training
@@ -225,8 +222,8 @@ if pairs_path is None:
 
 # Load models
 print0(f"Loading models...")
-policy = load_model(source="sft", device=device, phase="train")
-reference = load_model(source="sft", device=device, phase="eval")
+policy,   _, _ = load_model(source="sft", device=device, phase="train")
+reference, _, _ = load_model(source="sft", device=device, phase="eval")
 reference.eval()
 for p in reference.parameters():
     p.requires_grad_(False)
@@ -310,9 +307,9 @@ while step < max_steps:
         torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
         opt.step()
         
-        # KL controller
+        # KL controller: target absolute KL (chosen) for stability
         with torch.no_grad():
-            kl_now = dkl.mean().item()
+            kl_now = kl_c.mean().item()
             kl_beta *= math.exp(beta_gain * (kl_now - target_kl))
         
         # Logging
