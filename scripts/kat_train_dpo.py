@@ -24,18 +24,32 @@ class Pairset(Dataset):
 
     def __len__(self): return len(self.rows)
 
-    def _pack(self, prompt, answer):
-        text = (
-            "<|bos|>\n<|user_start|>" + prompt + "<|user_end|>\n" +
-            "<|assistant_start|>" + answer + "<|assistant_end|>\n"
-        )
-        ids = self.tok.encode(text, add_bos=False, add_eos=True)
-        return ids[: self.max_len]
+    def _pack(self, prefix_obj, answer):
+        """Pack conversation prefix + answer into tokens.
+        
+        NEW: prefix_obj is now a full conversation object {"messages": [...]}
+        """
+        if isinstance(prefix_obj, dict) and 'messages' in prefix_obj:
+            # New format: use render_for_completion to get prefix tokens
+            prefix_ids = self.tok.render_for_completion(prefix_obj)
+            answer_ids = self.tok.encode(answer)
+            assistant_end = self.tok.encode_special("<|assistant_end|>")
+            return (prefix_ids + answer_ids + assistant_end)[: self.max_len]
+        else:
+            # Fallback to old manual format (backward compatibility)
+            text = (
+                "<|bos|>\n<|user_start|>" + str(prefix_obj) + "<|user_end|>\n" +
+                "<|assistant_start|>" + answer + "<|assistant_end|>\n"
+            )
+            ids = self.tok.encode(text, add_bos=False, add_eos=True)
+            return ids[: self.max_len]
 
     def __getitem__(self, i):
         r = self.rows[i]
-        x_pos = self._pack(r["prompt"], r["chosen"])
-        x_neg = self._pack(r["prompt"], r["rejected"])
+        # NEW: Use prefix field instead of prompt
+        prefix = r.get("prefix", {"messages": []})
+        x_pos = self._pack(prefix, r["chosen"])
+        x_neg = self._pack(prefix, r["rejected"])
         return torch.tensor(x_pos), torch.tensor(x_neg)
 
 def collate(batch, pad_id):

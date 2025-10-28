@@ -149,8 +149,8 @@ echo "[6/9] Preparing pairwise preference data for GRPO..."
 echo "  [6a/9] Downloading preference pairs..."
 python -m scripts.kat_download_pairs --only hh  # Start with just HH for speed
 
-echo "  [6b/9] Deduplicating prompts..."
-python -m scripts.kat_make_prompts
+echo "  [6b/9] Making conversation prefix-only set..."
+python -m scripts.kat_make_prefixes
 
 echo ""
 echo "  [6c/9] Training Reward Models..."

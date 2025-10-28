@@ -89,9 +89,9 @@ def md5_16(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:16]
 
 class PairRow:
-    __slots__ = ("prompt", "chosen", "rejected")
+    __slots__ = ("prefix", "chosen", "rejected")
     def __init__(self, d: dict):
-        self.prompt = d["prompt"]
+        self.prefix = d.get("prefix", {"messages": []})  # NEW: Full conversation object
         self.chosen = d["chosen"]
         self.rejected = d["rejected"]
 
@@ -138,7 +138,12 @@ def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, devic
     pcs, prs, ccs, rrs = [], [], [], []
     
     for r in rows:
-        p = tokenizer.encode(r.prompt)
+        # NEW: Handle prefix conversation object using render_for_completion
+        if isinstance(r.prefix, dict) and 'messages' in r.prefix:
+            p = tokenizer.render_for_completion(r.prefix)
+        else:
+            p = tokenizer.encode("")  # Fallback
+        
         c = tokenizer.encode(r.chosen)
         j = tokenizer.encode(r.rejected)
         

@@ -1,23 +1,12 @@
-# Data Flow Reference: Density-Aware RM Training
+# Data Flow Reference: Prefix-Based Density-Aware Pipeline
 
 **Base directory:** `$HOME/.cache/nanochat/data/` (set by `get_base_dir()`)
 
-**KEY CHANGE:** Density-aware sampling now occurs during **RM TRAINING**, not GRPO.
+---
 
-```
-HH-RLHF (Anthropic) — ~169k comparison rows (each has chosen/rejected). Unique first-turn prompts are ~44k (H4’s prompt-only view).
-Hugging Face
-+1
+## Overview
 
-UltraFeedback-binarized (H4) — built from 64k prompts, one chosen vs one rejected per prompt → ~64k pairs.
-Hugging Face
-
-Stack-Exchange-Preferences (H4) — very large. The commonly used processed variant (stack-exchange-paired) has ~31.3M preference pairs (SE → pairs). If you read the raw H4 set and form one pair per eligible question, you’ll still get millions. Budget your disk/compute.
-Hugging Face
-+1
-```
-
-^ so i'm pretty sure the 30k numbers or whatever below are hallucinated but thats fine.
+Full pipeline for downloading preference pairs, extracting unique prefixes, computing embeddings with density weights, and training reward models with density-aware sampling.
 
 ---
 
@@ -25,274 +14,365 @@ Hugging Face
 
 ```bash
 # Setup
-python -m scripts.kat_download_pairs
-python -m scripts.kat_make_prompts
-python -m scripts.kat_compute_embeddings_offline
+python -m scripts.kat_download_pairs           # Downloads pairs from 3 sources
+python -m scripts.kat_make_prefixes            # Deduplicates by first user msg
+python -m scripts.kat_compute_embeddings_offline  # Computes embeddings + density
 
-# Test baseline (Hypothesis A)
+# Train RM baseline (uniform sampling)
 python -m scripts.kat_train_rm --max_steps=1000
+
+# Train RM with density awareness
+python -m scripts.kat_train_rm --density_aware --max_steps=1000
+
+# Train GRPO policy with RM
 python -m scripts.kat_train_grpo --rm_source rm --max_steps=5000
-
-# Test density in RM (Hypothesis B)
-python -m scripts.kat_train_rm --density_aware --max_steps=1000 --out_dir ~/.cache/nanochat/rm_checkpoints/d20_density
-python -m scripts.kat_train_grpo --rm_source rm_density --max_steps=5000
-
-# View results
-tensorboard --logdir ~/.cache/nanochat/
 ```
 
 ---
 
-## Stage 1: Download Pairs
+## Script Reference
 
-**Script:** `scripts/kat_download_pairs.py`
+### 1. `scripts/kat_download_pairs.py`
 
-**Output:**
+**Purpose:** Download preference pairs from HuggingFace datasets
 
-```
-~/.cache/nanochat/data/pairs_all.jsonl
-```
+**Inputs:** None (downloads from 3 remote sources)
 
-**Format:** JSONL (30,000 lines)
+**Outputs:**
+
+- `~/.cache/nanochat/data/pairs_all.jsonl` (~170k lines)
+
+**Format (each line):**
 
 ```json
 {
   "id": "uuid",
-  "prompt": "what is AI?",
-  "chosen": "...",
-  "rejected": "...",
-  "src": "hh"
+  "prefix": {
+    "messages": [
+      { "role": "user", "content": "What is AI?" },
+      { "role": "assistant", "content": "AI is..." },
+      { "role": "user", "content": "More details?" }
+    ]
+  },
+  "chosen": "Machine learning is a subset of AI...",
+  "rejected": "I don't know.",
+  "src": "hh-rlhf"
 }
 ```
 
----
+**Data shape:**
 
-## Stage 2: Extract Unique Prompts
+- ~169k pairs from HH-RLHF
+- ~64k pairs from UltraFeedback-binarized
+- ~31.3M pairs from Stack-Exchange-Preferences (but usually truncated)
+- **Total: ~170-200k pairs** (budget-dependent)
 
-**Script:** `scripts/kat_make_prompts.py`
+**Key fields:**
 
-**Input:** `pairs_all.jsonl` (30,000 pairs)
+- `prefix`: Full conversation object (dict with "messages" list)
+  - Each message: `{"role": "user"|"assistant", "content": str}`
+  - Last message is ALWAYS from user (ready for assistant response)
+- `chosen`: String response from assistant (positive example)
+- `rejected`: String response from assistant (negative example)
+- `src`: Source dataset identifier
 
-**Outputs:**
+**Sources:**
 
-### prompts_all.jsonl
-
-```
-~/.cache/nanochat/data/prompts_all.jsonl
-```
-
-**Format:** JSONL (28,000 lines - deduplicated)
-
-```json
-{ "id": "md5_hash_16chars", "prompt": "what is AI?" }
-```
-
-- **ID format:** `md5(prompt.encode('utf-8')).hexdigest()[:16]`
-- **Important:** Same hash computed in `kat_train_rm.py`
-
-### stats.txt
-
-```
-~/.cache/nanochat/data/stats.txt
-```
+- `hh-rlhf`: Anthropic HH-RLHF dataset
+- `ultrafeedback-binarized`: UltraFeedback-binarized
+- `stack-exchange-preferences`: StackExchange preferences
 
 ---
 
-## Stage 3: Compute Embeddings & Density Weights
+### 2. `scripts/kat_make_prefixes.py`
 
-**Script:** `scripts/kat_compute_embeddings_offline.py`
-
-**Input:** `prompts_all.jsonl` (28,000 unique prompts)
-
-**Output Directory:**
-
-```
-~/.cache/nanochat/data/embeddings_offline/
-├── embeddings.npy           (5.25 GB, [28000, 50304])
-├── density_weights.npy      (112 KB, [28000,])
-├── prompts_list.json        (~10 MB)
-└── embeddings_metadata.json (~1 KB)
-```
-
-**density_weights.npy:**
-
-- One weight per unique prompt (in same order as prompts_all.jsonl)
-- Weight = 1/density (computed via k-NN)
-- Normalized to sum to 1.0
-- High weight = rare prompt, Low weight = common prompt
-
----
-
-## Stage 4a: Train RM (Baseline)
-
-**Script:** `scripts/kat_train_rm.py` (no flags)
-
-**Input:** `pairs_all.jsonl`
-
-**Command:**
-
-```bash
-python -m scripts.kat_train_rm --max_steps=1000
-```
-
-**Sampling:** UNIFORM - all pairs equally likely
-
-**Output:** `~/.cache/nanochat/rm_checkpoints/d20/model_000000.pt`
-
----
-
-## Stage 4b: Train RM (Density-Aware)
-
-**Script:** `scripts/kat_train_rm.py --density_aware`
+**Purpose:** Deduplicate pairs by first user message, store full prefix objects
 
 **Inputs:**
 
-```
-~/.cache/nanochat/data/pairs_all.jsonl
-~/.cache/nanochat/data/prompts_all.jsonl
-~/.cache/nanochat/data/embeddings_offline/density_weights.npy
+- `pairs_all.jsonl` (~170k lines)
+
+**Outputs:**
+
+- `~/.cache/nanochat/data/prefixes_all.jsonl` (~28k lines, deduplicated)
+- `~/.cache/nanochat/data/prefix_id_map.tsv` (for reference)
+- `~/.cache/nanochat/data/stats.txt` (statistics)
+
+**Format (prefixes_all.jsonl - each line):**
+
+```json
+{
+  "id": "md5_hash_16chars",
+  "prefix": {
+    "messages": [
+      { "role": "user", "content": "..." },
+      { "role": "assistant", "content": "..." }
+    ]
+  }
+}
 ```
 
-**Command:**
+**Data shape:**
+
+- Deduplicates by: `md5(first_user_message)[:16]`
+- Stores: **FULL prefix object** (entire conversation)
+- ~28,000 unique first-user-messages from 170,000 pairs
+- Dedup ratio: ~16% (84% duplicate prompts)
+
+**Key points:**
+
+- ID is deterministic: same prompt always gets same hash
+- Stores complete conversation context (not just first prompt)
+- Later used for embedding computation
+
+---
+
+### 4. `scripts/kat_compute_embeddings_offline.py`
+
+**Purpose:** Precompute embeddings and density weights using sklearn
+
+**Inputs:**
+
+- `--prompts_path` JSONL with either prefix or prompt format
+- `--model_name` default "base", mean pools hidden states to get embedding
+- `--k` (default: 20, neighbors for density)
+
+**Outputs (to `--output_dir`):**
+
+```
+embeddings_offline/
+├── embeddings.npy           [N, 384]  (float32)
+├── density_weights.npy      [N,]      (float32, normalized to sum=1)
+├── ids.json                 (ordered list of item IDs, maps embeddings to prefixes_all.jsonl)
+└── embeddings_metadata.json (config + stats)
+```
+
+**Usage:**
 
 ```bash
+python -m scripts.kat_compute_embeddings_offline \
+  --prompts_path data/prefixes_all.jsonl \
+  --output_dir data/embeddings_offline \
+  --k 20 \
+  --batch_size 32
+```
+
+**Data shape:**
+
+- Embeddings: `[28000, 384]` (sentence-transformers output)
+- Weights: `[28000,]`, normalized to sum=1.0
+- Higher weight = rarer prompt
+- Formula: `weight = 1 / (density + eps)` where density = k-NN similarity
+
+---
+
+### 5. `scripts/kat_train_rm.py`
+
+**Purpose:** Train reward model on preference pairs (optionally with density weighting)
+
+**Inputs:**
+
+- `pairs_all.jsonl` (170k pairs with full prefix objects)
+- `prefixes_all.jsonl` (28k unique prefixes, for ID mapping)
+- `density_weights.npy` (if `--density_aware` flag)
+
+**Outputs:**
+
+- Checkpoint: `~/.cache/nanochat/rm_checkpoints/d20/model_*.pt`
+
+**Data flow:**
+
+1. Load pairs (each with full `prefix` object)
+2. For each pair: tokenize with `tokenizer.render_for_completion(prefix)`
+3. Append chosen/rejected response tokens
+4. If density-aware: assign weight per pair based on first-user-message hash
+5. Use WeightedRandomSampler for training
+
+**Command examples:**
+
+```bash
+# Baseline: uniform sampling
+python -m scripts.kat_train_rm --max_steps=1000
+
+# Density-aware: rare prompts ~100x more often
 python -m scripts.kat_train_rm --density_aware --max_steps=1000 \
   --out_dir ~/.cache/nanochat/rm_checkpoints/d20_density
 ```
 
-**How It Works:**
+**Key processing:**
 
-1. Load `prompts_all.jsonl` → Build mapping: `prompt_id → weight_index`
-2. Load `density_weights.npy`
-3. For each pair in `pairs_all.jsonl`:
-   - Compute: `prompt_id = md5(pair['prompt'])[:16]`
-   - Look up: `weight_idx = prompt_id_to_weight_idx[prompt_id]`
-   - Get weight: `weight = density_weights[weight_idx]`
-   - Assign: `pair_weights[pair_idx] = weight`
-4. Create `WeightedRandomSampler(pair_weights)`
-
-**Result:** Rare prompts sampled ~1/density times MORE often
-
-**Output:** `~/.cache/nanochat/rm_checkpoints/d20_density/model_000000.pt`
+- Input prefix: `{"messages": [...]}` (full conversation)
+- `tokenizer.render_for_completion(prefix)` → token sequence ending with `<|assistant_start|>`
+- Append `chosen_tokens` or `rejected_tokens` to prefix
+- Creates paired examples: (prefix+chosen, prefix+rejected)
 
 ---
 
-## Stage 5: Train GRPO (Always Uniform)
+### 6. `scripts/kat_train_dpo.py`
 
-**Script:** `scripts/kat_train_grpo.py`
+**Purpose:** Train policy with DPO (Direct Preference Optimization)
 
-**Input:** `pairs_all.jsonl` + RM checkpoint
+**Inputs:**
 
-**Commands:**
+- `pairs_all.jsonl` (170k pairs with prefix objects)
+
+**Outputs:**
+
+- Checkpoint: `~/.cache/nanochat/dpo_checkpoints/model_*.pt`
+
+**Data processing:**
+
+- Each pair (prefix, chosen, rejected) becomes two training examples
+- Uses `tokenizer.render_for_completion(prefix)` to get prefix tokens
+- Appends chosen/rejected response tokens
+- Computes DPO loss
+
+**Command:**
 
 ```bash
-# With baseline RM
-python -m scripts.kat_train_grpo --rm_source rm --max_steps=5000
-
-# With density-aware RM
-python -m scripts.kat_train_grpo --rm_source rm_density --max_steps=5000
-```
-
-**Sampling:** UNIFORM (always) - no density weighting at GRPO level
-
-**Output:** `~/.cache/nanochat/grpo_checkpoints/d20/model_000000.pt`
-
----
-
-## Three Hypotheses
-
-### A: Baseline (Uniform → Uniform)
-
-- RM trains uniformly on all prompts
-- GRPO trains uniformly on all pairs
-- Expected: Baseline performance
-
-### B: Density in RM (Weighted → Uniform)
-
-- RM trains with rare prompts ~100x more often
-- GRPO trains uniformly, gets clean reward signals
-- Expected: +10-30% improvement
-
-### C: Density in GRPO (Uniform → Weighted)
-
-- RM trains uniformly
-- GRPO trains with rare prompts ~100x more often
-- Expected: Marginal improvement (noisy RM signals)
-
----
-
-## The Key Fix: No Separate Index File
-
-**OLD (Broken):**
-
-- Had `prompt_to_pairs_index.json` mapping
-- Still not properly mapping weights
-
-**NEW (Clean):**
-
-- Both files use same MD5 hash: `md5(prompt)[:16]`
-- Build mapping on-the-fly from `prompts_all.jsonl`
-- ✓ All pairs with same prompt get identical weight
-
-**Code:**
-
-```python
-# Load mapping
-prompt_id_to_weight_idx = {}
-with open("prompts_all.jsonl") as f:
-    for idx, line in enumerate(f):
-        prompt_id = json.loads(line)['id']
-        prompt_id_to_weight_idx[prompt_id] = idx
-
-# Use it for each pair
-prompt_id = md5(pair['prompt'])[:16]
-weight_idx = prompt_id_to_weight_idx[prompt_id]
-pair_weight = weights[weight_idx]
+python -m scripts.kat_train_dpo --pairs data/pairs_all.jsonl
 ```
 
 ---
 
-## File Dependency
+### 7. `scripts/kat_train_grpo.py`
+
+**Purpose:** Train policy with GRPO (Generative Reward Policy Optimization)
+
+**Inputs:**
+
+- `pairs_all.jsonl` (training pairs)
+- RM checkpoint (from `kat_train_rm.py`)
+
+**Outputs:**
+
+- Checkpoint: `~/.cache/nanochat/grpo_checkpoints/model_*.pt`
+
+**Command:**
+
+```bash
+python -m scripts.kat_train_grpo \
+  --rm_source rm_density \
+  --max_steps=5000
+```
+
+---
+
+### 8. `scripts/kat_viz_embeddings.py`
+
+**Purpose:** 3D visualization of prefix embeddings and density
+
+**Inputs:**
+
+- `pairs_all.jsonl` (with prefix objects)
+- Embedding model
+
+**Outputs:**
+
+- `.cache/embeddings_3d.json` (JSON for web visualization)
+
+**Extracts text from:**
+
+- New format: concatenates all messages from prefix
+- Legacy format: uses direct prompt field
+
+---
+
+## File Dependency Graph
 
 ```
-pairs_all.jsonl (30k)
-     ↓
-kat_make_prompts.py
-     ↓
-prompts_all.jsonl (28k unique)
-     ↓
-kat_compute_embeddings_offline.py
-     ↓
-density_weights.npy (28k weights)
-     ↓
-kat_train_rm.py --density_aware
-  (reads: pairs_all.jsonl + prompts_all.jsonl + density_weights.npy)
-     ↓
-rm_checkpoints/d20_density/
-     ↓
-kat_train_grpo.py --rm_source rm_density
-     ↓
-grpo_checkpoints/d20_density/
+┌─ HH-RLHF (HuggingFace)
+├─ UltraFeedback (HuggingFace)
+└─ Stack-Exchange (HuggingFace)
+         ↓
+    kat_download_pairs.py
+         ↓
+    pairs_all.jsonl (~170k)
+    ├─ prefix: full conversation objects
+    ├─ chosen: response string
+    ├─ rejected: response string
+    └─ src: dataset source
+         ↓
+    kat_make_prefixes.py
+         ↓
+    prefixes_all.jsonl (~28k, deduplicated)
+    └─ prefix: full conversation objects
+         ↓
+    kat_compute_embeddings_offline.py
+         ↓
+    embeddings_offline/
+    ├── embeddings.npy [28k, 384]
+    ├── density_weights.npy [28k,]
+    └── ids.json
+         ↓
+    ┌─────────────────────────────┐
+    │ kat_train_rm.py             │
+    │ (reads pairs_all.jsonl +    │
+    │  density_weights.npy)       │
+    └──────────┬──────────────────┘
+               ↓
+    rm_checkpoints/d20*/model_*.pt
+               ↓
+    ┌─────────────────────────────┐
+    │ kat_train_grpo.py           │
+    │ kat_train_dpo.py            │
+    └─────────────────────────────┘
+               ↓
+    policy_checkpoints/model_*.pt
 ```
+
+---
+
+## Data Format Summary
+
+| File                  | Format | Lines | Shape       | Key Fields                                    |
+| --------------------- | ------ | ----- | ----------- | --------------------------------------------- |
+| `pairs_all.jsonl`     | JSONL  | ~170k | —           | `prefix` (conversation), `chosen`, `rejected` |
+| `prefixes_all.jsonl`  | JSONL  | ~28k  | —           | `id` (md5 hash), `prefix` (conversation)      |
+| `embeddings.npy`      | NumPy  | —     | [28k, 384]  | float32 embeddings                            |
+| `density_weights.npy` | NumPy  | —     | [28k,]      | float32, normalized to sum=1                  |
+| `ids.json`            | JSON   | —     | [28k items] | Ordered list of item IDs                      |
 
 ---
 
 ## Validation Checklist
 
-When running `kat_train_rm.py --density_aware`, you should see:
+When running the full pipeline:
 
 ```
-Density-Aware Sampling Enabled
-✓ Loaded density weights for 28000 unique prompts
-✓ Loaded prompt ID to weight index mapping (28000 prompts)
-✓ Assigned density weights to 30000/30000 pairs
-  Min weight: 0.000001, Max weight: 0.050234
-✓ Created WeightedRandomSampler
+✓ kat_download_pairs.py → 170k+ pairs downloaded
+✓ kat_make_prefixes.py → 28k unique prefixes extracted
+✓ kat_compute_embeddings_offline.py → embeddings.npy [28k,384], weights [28k,]
+✓ kat_train_rm.py --density_aware → All 170k pairs assigned weights
+  - Weights span large range (1e-6 to 0.1+)
+  - Rare prompts get 50-100x higher weight
+✓ kat_train_grpo.py → Policy trained successfully
 ```
 
-Check:
+---
 
-- ✓ All 30,000 pairs assigned
-- ✓ Min weight << 1e-3
-- ✓ Max weight ~ 0.01-0.1
-- ✓ Ratio ~ 50k-100k times difference
+## Key Implementation Details
+
+### Prefix Format
+
+- **Input to training:** Full conversation object `{"messages": [...]}`
+- **Last message:** ALWAYS from user (enables assistant response)
+- **Multi-turn support:** HH-RLHF preserves full conversation history
+- **Processing:** `tokenizer.render_for_completion(prefix)` adds `<|assistant_start|>` token
+
+### Density Weighting
+
+- **Computed on:** First user message (deterministic hashing)
+- **Method:** k-NN density with cosine similarity
+- **Formula:** `weight = 1 / (density + eps)`
+- **Applied at:** RM training (weighted sampler)
+- **Effect:** Rare prompts ~100x more training samples
+
+### Backward Compatibility
+
+All scripts handle both:
+
+- **New format:** `prefix` dict with full conversation
+- **Legacy format:** `prompt` string field
+
+This enables graceful migration and mixed data pipelines.

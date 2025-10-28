@@ -14,7 +14,7 @@ Output files (in output_dir):
     - embeddings.npy          (28k x 768 float32 array)
     - embeddings_metadata.json (statistics and parameters)
     - density_weights.npy      (28k float32 array of density weights)
-    - prompts_list.json        (list of prompts in same order as embeddings)
+    - ids.json                 (list of item IDs in same order as embeddings)
 
 These files are then loaded by kat_train_grpo.py with --use_precomputed_embeddings flag.
 """
@@ -34,41 +34,67 @@ from nanochat.tokenizer import get_tokenizer
 
 
 def load_prompts(prompts_path):
-    """Load prompt list from JSONL file."""
-    prompts = []
+    """Load prefix objects or prompts from JSONL file."""
+    items = []
     with open(prompts_path, 'r') as f:
         for line_no, line in enumerate(f, 1):
             try:
                 obj = json.loads(line)
-                if 'prompt' not in obj:
-                    print(f"⚠️  Line {line_no}: missing 'prompt' field, skipping")
-                    continue
-                prompts.append(obj['prompt'])
+                # New format: prefix object
+                if 'prefix' in obj:
+                    items.append(obj)
+                # Legacy format: prompt string
+                elif 'prompt' in obj:
+                    items.append(obj)
+                else:
+                    print(f"⚠️  Line {line_no}: missing both 'prefix' and 'prompt' fields, skipping")
             except json.JSONDecodeError as e:
                 print(f"⚠️  Line {line_no}: invalid JSON ({e}), skipping")
                 continue
     
-    if len(prompts) == 0:
-        raise RuntimeError(f"No valid prompts found in {prompts_path}")
+    if len(items) == 0:
+        raise RuntimeError(f"No valid items found in {prompts_path}")
     
-    return prompts
+    return items
 
 
-def compute_embeddings(prompts, base_model, tokenizer, device, batch_size=8):
+def extract_text_from_item(item):
+    """Extract text for embedding from either prefix object or legacy prompt."""
+    # New format: prefix is a conversation object
+    if 'prefix' in item and isinstance(item['prefix'], dict):
+        prefix = item['prefix']
+        messages = prefix.get('messages', [])
+        text_parts = []
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if content:
+                text_parts.append(f"{role}: {content}")
+        if text_parts:
+            return "\n".join(text_parts)
+    
+    # Legacy format: direct prompt
+    if 'prompt' in item:
+        return item['prompt']
+    
+    return ""
+
+
+def compute_embeddings(items, base_model, tokenizer, device, batch_size=8):
     """
-    Compute embeddings for all prompts using the base model's hidden states.
+    Compute embeddings for all items (prefixes or prompts) using the base model's hidden states.
     
     Args:
-        prompts: List of prompt strings
+        items: List of dicts with 'prefix' (conversation object) or 'prompt' (string)
         base_model: GPT model loaded on device
         tokenizer: Tokenizer instance
         device: Device to run on (cuda/cpu)
-        batch_size: Number of prompts per batch
+        batch_size: Number of items per batch
     
     Returns:
-        embeddings: (n_prompts, n_embd) float32 numpy array (dense semantic embeddings, ~768 dims)
+        embeddings: (n_items, n_embd) float32 numpy array (dense semantic embeddings, ~768 dims)
     """
-    print(f"Computing embeddings for {len(prompts)} prompts...")
+    print(f"Computing embeddings for {len(items)} items...")
     print(f"  Batch size: {batch_size}")
     print(f"  Device: {device}")
     
@@ -76,16 +102,16 @@ def compute_embeddings(prompts, base_model, tokenizer, device, batch_size=8):
     base_model.eval()
     
     with torch.no_grad():
-        for batch_idx in range(0, len(prompts), batch_size):
+        for batch_idx in range(0, len(items), batch_size):
             if batch_idx % (batch_size * 10) == 0:
-                pct = 100.0 * batch_idx / len(prompts)
+                pct = 100.0 * batch_idx / len(items)
                 print(f"  [{pct:5.1f}%] Processing batch {batch_idx // batch_size}...", flush=True)
             
-            batch_prompts = prompts[batch_idx:batch_idx + batch_size]
+            batch_items = items[batch_idx:batch_idx + batch_size]
             
             # Tokenize
             try:
-                encoded = [tokenizer.encode(p) for p in batch_prompts]
+                encoded = [tokenizer.encode(extract_text_from_item(item)) for item in batch_items]
             except Exception as e:
                 print(f"⚠️  Error encoding batch starting at {batch_idx}: {e}")
                 continue
@@ -176,13 +202,13 @@ def compute_density_weights(embeddings, k=10):
     return weights
 
 
-def save_embeddings(embeddings, weights, prompts, output_dir, model_config):
+def save_embeddings(embeddings, weights, items, output_dir, model_config):
     """Save embeddings, weights, and metadata to disk."""
     os.makedirs(output_dir, exist_ok=True)
     
     embeddings_path = os.path.join(output_dir, "embeddings.npy")
     weights_path = os.path.join(output_dir, "density_weights.npy")
-    prompts_path = os.path.join(output_dir, "prompts_list.json")
+    ids_path = os.path.join(output_dir, "ids.json")
     metadata_path = os.path.join(output_dir, "embeddings_metadata.json")
     
     print(f"\nSaving outputs to {output_dir}...")
@@ -195,14 +221,15 @@ def save_embeddings(embeddings, weights, prompts, output_dir, model_config):
     np.save(weights_path, weights.astype(np.float32))
     print(f"✓ Saved density weights ({weights.shape}) to {weights_path}")
     
-    # Save prompts list
-    with open(prompts_path, 'w') as f:
-        json.dump(prompts, f)
-    print(f"✓ Saved {len(prompts)} prompts to {prompts_path}")
+    # Save IDs in order (to map embeddings back to prefixes_all.jsonl)
+    ids = [item.get("id", f"idx_{i}") for i, item in enumerate(items)]
+    with open(ids_path, 'w') as f:
+        json.dump(ids, f)
+    print(f"✓ Saved {len(ids)} item IDs to {ids_path}")
     
     # Save metadata
     metadata = {
-        "n_prompts": len(prompts),
+        "n_items": len(items),
         "embedding_dim": embeddings.shape[1],
         "embedding_dtype": "float32",
         "weights_dtype": "float32",
@@ -239,7 +266,7 @@ def main():
     parser.add_argument(
         "--prompts_path",
         default=None,
-        help="Path to prompts_all.jsonl (auto-detected if not provided)",
+        help="Path to prefixes_all.jsonl (auto-detected if not provided)",
     )
     parser.add_argument(
         "--output_dir",
@@ -270,7 +297,7 @@ def main():
     base_dir = get_base_dir()
     
     if args.prompts_path is None:
-        args.prompts_path = os.path.join(base_dir, "data", "prompts_all.jsonl")
+        args.prompts_path = os.path.join(base_dir, "data", "prefixes_all.jsonl")
     
     if args.output_dir is None:
         args.output_dir = os.path.join(base_dir, "data", "embeddings_offline")
@@ -278,7 +305,7 @@ def main():
     # Validate inputs
     if not os.path.exists(args.prompts_path):
         print(f"❌ Error: Prompts file not found: {args.prompts_path}")
-        print(f"   Run kat_make_prompts.py first to generate prompts_all.jsonl")
+        print(f"   Run kat_make_prefixes.py first to generate prefixes_all.jsonl")
         sys.exit(1)
     
     print("=" * 70)
@@ -310,8 +337,8 @@ def main():
     # Load prompts
     print("Loading prompts...")
     try:
-        prompts = load_prompts(args.prompts_path)
-        print(f"✓ Loaded {len(prompts)} prompts")
+        items = load_prompts(args.prompts_path)
+        print(f"✓ Loaded {len(items)} items")
     except Exception as e:
         print(f"❌ Error loading prompts: {e}")
         sys.exit(1)
@@ -320,7 +347,7 @@ def main():
     print()
     try:
         embeddings = compute_embeddings(
-            prompts,
+            items,
             model,
             tokenizer,
             device=args.device,
@@ -344,7 +371,7 @@ def main():
             "vocab_size": meta.get("vocab_size", 50304) if meta else 50304,
             "n_embd": meta.get("n_embd", 768) if meta else 768,
         }
-        save_embeddings(embeddings, weights, prompts, args.output_dir, model_config)
+        save_embeddings(embeddings, weights, items, args.output_dir, model_config)
     except Exception as e:
         print(f"❌ Error saving outputs: {e}")
         sys.exit(1)

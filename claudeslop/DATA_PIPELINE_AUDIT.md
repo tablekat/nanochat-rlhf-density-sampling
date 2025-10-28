@@ -57,15 +57,15 @@ Complete audit of the nanochat pairs data pipeline, including the new prefix-bas
 
 ---
 
-### Step 2: `kat_make_prompts.py` - Deduplication
+### Step 2: `kat_make_prefixes.py` - Deduplication
 
 **Purpose**: Extract unique prompts and create mapping
 
 **Input**: `pairs_all.jsonl` (new format with prefix field)
 **Output**:
 
-- `prompts_all.jsonl` - deduplicated prompts
-- `prompt_id_map.tsv` - prompt_id ↔ prompt mapping
+- `prefixes_all.jsonl` - deduplicated prefixes
+- `prefix_id_map.tsv` - prefix_id ↔ prompt mapping
 - `stats.txt` - deduplication statistics
 
 **Changes Needed** ⚠️:
@@ -174,21 +174,21 @@ def __getitem__(self, idx):
 
 ## Format Compatibility Matrix
 
-| Component              | Input Format      | Output Format      | Status       |
-| ---------------------- | ----------------- | ------------------ | ------------ |
-| kat_download_pairs     | Raw HF datasets   | prefix-based pairs | ✅ Updated   |
-| kat_make_prompts       | pairs_all.jsonl   | prompts_all.jsonl  | ⚠️ Needs fix |
-| kat_embed              | prompts_all.jsonl | embeddings.pt      | ✅ OK        |
-| kat_inv_density_sample | embeddings.pt     | sampled indices    | ✅ OK        |
-| kat_train_rm           | pairs_all.jsonl   | reward model       | ⚠️ Needs fix |
-| kat_train_dpo          | pairs_all.jsonl   | policy model       | ⚠️ Needs fix |
-| kat_train_grpo         | pairs_all.jsonl   | policy model       | ⚠️ Needs fix |
+| Component              | Input Format       | Output Format      | Status       |
+| ---------------------- | ------------------ | ------------------ | ------------ |
+| kat_download_pairs     | Raw HF datasets    | prefix-based pairs | ✅ Updated   |
+| kat_make_prefixes      | pairs_all.jsonl    | prefixes_all.jsonl | ✅ Updated   |
+| kat_embed              | prefixes_all.jsonl | embeddings.pt      | ✅ OK        |
+| kat_inv_density_sample | embeddings.pt      | sampled indices    | ✅ OK        |
+| kat_train_rm           | pairs_all.jsonl    | reward model       | ⚠️ Needs fix |
+| kat_train_dpo          | pairs_all.jsonl    | policy model       | ⚠️ Needs fix |
+| kat_train_grpo         | pairs_all.jsonl    | policy model       | ⚠️ Needs fix |
 
 ---
 
 ## To-Do: Updates Required
 
-1. **kat_make_prompts.py** - Extract prompt from prefix object
+1. **kat_make_prefixes.py** - Extract prefix from conversation objects
 2. **kat_train_rm.py** - Use render_for_completion() on prefix
 3. **kat_train_dpo.py** - Use render_for_completion() on prefix
 4. **kat_train_grpo.py** - Use render_for_completion() on prefix
@@ -213,8 +213,8 @@ Raw HH-RLHF String
     └─→ Parse Human:/Assistant: format
         └─→ Extract conversations with last user message
             └─→ pairs_all.jsonl (prefix-based format)
-                └─→ kat_make_prompts.py (⚠️ NEEDS UPDATE)
-                    └─→ prompts_all.jsonl
+                └─→ kat_make_prefixes.py (✅ UPDATED)
+                    └─→ prefixes_all.jsonl
                         └─→ kat_embed.py
                             └─→ embeddings.pt
                                 └─→ kat_inv_density_sample.py

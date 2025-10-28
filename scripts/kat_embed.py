@@ -1,11 +1,17 @@
-# scripts/embed.py
+# scripts/kat_embed.py
 """
-python scripts/kat_embed.py \
-  --ckpt out/ckpt.pt \
-  --tokenizer tokenizer.model \
-  --data data/my_conversations.jsonl \
-  --out data/my_conversations_emb.pt \
-  --batch_size 32
+Compute embeddings for prefixes or prompts.
+
+Can handle either:
+- prefixes_all.jsonl with full prefix conversation objects
+- Legacy prompts_all.jsonl with simple prompt strings
+
+Usage:
+  python scripts/kat_embed.py \\
+    --ckpt_source sft \\
+    --data data/prefixes_all.jsonl \\
+    --out data/prefixes_emb.pt \\
+    --batch_size 32
 """
 import os, json, argparse, torch, ujson as jsonf, sys
 from torch.nn.functional import normalize
@@ -13,7 +19,7 @@ from tqdm import tqdm
 
 from nanochat.gpt import GPT
 from nanochat.checkpoint_manager import load_model, get_base_dir
-# ^ Model/tokenizer names match the repo; minimal codebase exposes them. :contentReference[oaicite:3]{index=3}
+from nanochat.tokenizer import get_tokenizer
 
 def batch(iterable, n):
     buf = []
@@ -24,18 +30,33 @@ def batch(iterable, n):
             buf = []
     if buf: yield buf
 
-def to_chat_text(prompt, answer=None):
-    # Harmony-ish chat tags. :contentReference[oaicite:4]{index=4}
-    s = "<|bos|>\n<|user_start|>" + prompt + "<|user_end|>\n"
-    if answer is not None:
-        s += "<|assistant_start|>" + answer + "<|assistant_end|>\n"
-    return s
+def extract_text_from_row(row):
+    """Extract text for embedding from either prefix object or legacy prompt string."""
+    # New format: prefix is a full conversation object
+    if 'prefix' in row and isinstance(row['prefix'], dict):
+        prefix = row['prefix']
+        messages = prefix.get('messages', [])
+        # Concatenate all messages for embedding context
+        text_parts = []
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if content:
+                text_parts.append(f"{role}: {content}")
+        if text_parts:
+            return "\n".join(text_parts)
+    
+    # Legacy format: direct prompt field
+    if 'prompt' in row:
+        return row['prompt']
+    
+    return ""
 
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt_source", default="sft", help="Model checkpoint source (base|mid|sft|grpo|rm)")
-    ap.add_argument("--data", required=True, help="jsonl with fields: id, prompt, (optional) assistant")
+    ap.add_argument("--data", required=True, help="jsonl with fields: id, prefix (or prompt)")
     ap.add_argument("--out", required=True, help="output .pt with {'ids':..., 'emb': tensor[N,d]}")
     ap.add_argument("--batch_size", type=int, default=16)
     args = ap.parse_args()
@@ -60,7 +81,9 @@ def main():
 
     embs = []
     for chunk in tqdm(batch(rows, args.batch_size)):
-        texts = [to_chat_text(r["prompt"], r.get("assistant")) for r in chunk]
+        # Extract text from either prefix or prompt format
+        texts = [extract_text_from_row(r) for r in chunk]
+        
         # tokenize using nanochat tokenizer
         toks = [tokenizer.encode(t) for t in texts]
         max_len = max(len(t) for t in toks)
@@ -71,7 +94,6 @@ def main():
             x[i, :len(t)] = torch.tensor(t, dtype=torch.long, device=device)
 
         # forward pass to get hidden states
-        # Use the new return_hidden_states parameter
         output = model(x, return_hidden_states=True)
         logits = output['logits']  # [B,T,V]
         hidden = output['hidden_states']  # [B,T,D]

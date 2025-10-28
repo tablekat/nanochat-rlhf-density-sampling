@@ -86,7 +86,7 @@ def md5_16(s: str) -> str:
 
 @dataclass
 class PairRow:
-    prompt: str
+    prefix: dict  # NEW: Full conversation object
     chosen: str
     rejected: str
     weight: float
@@ -94,15 +94,36 @@ class PairRow:
 class PairsDataset(Dataset):
     def __init__(self, pairs_path: Path, density: Optional[Dict[str, float]]):
         self.rows: List[PairRow] = []
+        self.tokenizer = get_tokenizer()  # For render_for_completion
+        
         with pairs_path.open("r", encoding="utf-8") as f:
             for line in f:
                 ex = json.loads(line)
                 w = 1.0
-                if density is not None:
-                    w = float(density.get(md5_16(ex["prompt"]), 1.0))
+                
+                # Extract prompt ID for density weighting
+                if 'prefix' in ex and isinstance(ex['prefix'], dict):
+                    # New format: extract first user message
+                    messages = ex['prefix'].get('messages', [])
+                    prompt_id_str = None
+                    for msg in messages:
+                        if msg.get('role') == 'user':
+                            prompt_id_str = md5_16(msg.get('content', ''))
+                            break
+                elif 'prompt' in ex:
+                    # Old format: direct prompt
+                    prompt_id_str = md5_16(ex["prompt"])
+                else:
+                    continue
+                
+                if density is not None and prompt_id_str:
+                    w = float(density.get(prompt_id_str, 1.0))
+                
                 self.rows.append(PairRow(
-                    prompt=ex["prompt"], chosen=ex["chosen"],
-                    rejected=ex["rejected"], weight=w
+                    prefix=ex.get("prefix", {"messages": []}),
+                    chosen=ex["chosen"],
+                    rejected=ex["rejected"],
+                    weight=w
                 ))
     
     def __len__(self): 
@@ -130,7 +151,7 @@ def load_density_mapping(prompts_path: Path, weights_path: Path) -> Dict[str, fl
         for line in f:
             ids.append(json.loads(line)["id"])
     weights = np.load(weights_path)
-    assert len(ids) == len(weights), "prompts_all.jsonl and density_weights.npy misaligned"
+    assert len(ids) == len(weights), "prefixes_all.jsonl and density_weights.npy misaligned"
     return {pid: float(w) for pid, w in zip(ids, weights.tolist())}
 
 def truncate_two(p: List[int], r: List[int], max_len: int, min_prompt: int) -> Tuple[List[int], List[int]]:
@@ -151,7 +172,14 @@ def make_batch(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, de
     weights = []
     
     for row in rows:
-        p = tokenizer.encode(row.prompt)
+        # NEW: Handle prefix conversation object using render_for_completion
+        if isinstance(row.prefix, dict) and 'messages' in row.prefix:
+            # Use render_for_completion to get tokens including <|assistant_start|>
+            p = tokenizer.render_for_completion(row.prefix)
+        else:
+            # Fallback for old format (should not happen with new kat_download_pairs)
+            p = tokenizer.encode("")
+        
         c = tokenizer.encode(row.chosen)
         r = tokenizer.encode(row.rejected)
         
@@ -241,8 +269,8 @@ print0(f"Loading preference dataset from {pairs_path}...")
 density = None
 if density_aware:
     print0(f"Loading density weights from {density_weights_path}...")
-    prompts_path = os.path.join(base, "data", "prompts_all.jsonl")
-    density = load_density_mapping(Path(prompts_path), Path(density_weights_path))
+    prefixes_path = os.path.join(base, "data", "prefixes_all.jsonl")
+    density = load_density_mapping(Path(prefixes_path), Path(density_weights_path))
 
 ds = PairsDataset(Path(pairs_path), density)
 print0(f"Dataset size: {len(ds)} pairs | density_aware={density_aware}")

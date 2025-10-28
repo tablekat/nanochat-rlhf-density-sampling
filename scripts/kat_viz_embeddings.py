@@ -49,6 +49,28 @@ def load_pairs(path):
     return pairs
 
 
+def extract_text_from_pair(pair):
+    """Extract text for embedding from either prefix object or legacy prompt field."""
+    # New format: prefix is a full conversation object
+    if 'prefix' in pair and isinstance(pair['prefix'], dict):
+        prefix = pair['prefix']
+        messages = prefix.get('messages', [])
+        text_parts = []
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if content:
+                text_parts.append(f"{role}: {content}")
+        if text_parts:
+            return "\n".join(text_parts)
+    
+    # Legacy format: direct prompt field
+    if 'prompt' in pair:
+        return pair['prompt']
+    
+    return ""
+
+
 def compute_embeddings(texts, model_name="sentence-transformers/all-MiniLM-L6-v2"):
     """Compute embeddings using sentence-transformers."""
     try:
@@ -154,7 +176,7 @@ def create_visualization_data(pairs, embeddings_3d, local_density):
             'color': color,
             'density': float(density),
             'source': src,
-            'prompt': pair.get('prompt', '')[:200],  # First 200 chars
+            'prompt': extract_text_from_pair(pair)[:200],  # First 200 chars
             'chosen': pair.get('chosen', '')[:100],
             'rejected': pair.get('rejected', '')[:100],
         }
@@ -214,7 +236,7 @@ def main():
     print("")
     
     # Extract prompts
-    prompts = [p.get('prompt', '') for p in pairs]
+    prompts = [extract_text_from_pair(p) for p in pairs]
     
     # Compute embeddings
     embeddings = compute_embeddings(prompts, args.model_name)
