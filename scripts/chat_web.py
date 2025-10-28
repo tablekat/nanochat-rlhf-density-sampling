@@ -272,7 +272,8 @@ async def embedding_viz():
 @app.get("/api/embeddings_3d")
 async def embeddings_3d():
     """Serve 3D embedding data for visualization."""
-    embeddings_path = os.path.join(".cache", "embeddings_3d.json")
+    base_dir = get_base_dir()
+    embeddings_path = os.path.join(base_dir, "embeddings_3d.json")
     if not os.path.exists(embeddings_path):
         raise HTTPException(status_code=404, detail="Embedding data not found. Run: python -m scripts.kat_viz_embeddings")
     with open(embeddings_path, "r") as f:

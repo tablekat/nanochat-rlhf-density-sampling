@@ -341,7 +341,7 @@
 
             const total = data.points.length;
             const avgDensity = data.points.reduce((sum, p) => sum + p.density, 0) / total;
-            const sources = data.metadata.sources.length;
+            const sources = Object.keys(data.metadata.colors).length;
 
             const statsHtml = `
                 <div class="stat-item">
@@ -365,9 +365,8 @@
             document.getElementById('stats').innerHTML = statsHtml;
 
             // Update legend
-            const legendHtml = data.metadata.colors
-                .map((color, src) => {
-                    const srcName = Object.keys(data.metadata.colors)[Object.values(data.metadata.colors).indexOf(color)];
+            const legendHtml = Object.entries(data.metadata.colors)
+                .map(([srcName, color]) => {
                     return `
                         <div class="legend-item">
                             <div class="legend-color" style="background: rgb(${Math.round(color[0]*255)}, ${Math.round(color[1]*255)}, ${Math.round(color[2]*255)})"></div>
@@ -478,9 +477,9 @@
             const html = `
                 <div class="info-section" style="background: #1a1f3a; padding: 15px; border-radius: 4px; border-left: 4px solid #10b981;">
                     <div class="info-label">Selected Point</div>
-                    <div class="info-value" style="margin-bottom: 10px;">${escapeHtml(point.prompt)}</div>
-                    <div class="info-label" style="margin-top: 10px;">Chosen Response</div>
-                    <div class="info-value" style="font-size: 12px; color: #aaa; margin-bottom: 10px;">${escapeHtml(point.chosen)}</div>
+                    <div class="info-value" style="margin-bottom: 10px;">${escapeHtml(point.prefix)}</div>
+                    <div class="info-label" style="margin-top: 10px;">Density Weight</div>
+                    <div class="info-value" style="font-size: 12px; color: #aaa; margin-bottom: 10px;">Inverse density: ${point.weight.toFixed(3)}</div>
                     <div class="info-label">Density: ${(point.density * 100).toFixed(1)}%</div>
                     <div class="info-label">Source: ${point.source}</div>
                 </div>
