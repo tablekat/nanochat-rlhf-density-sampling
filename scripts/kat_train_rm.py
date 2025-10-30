@@ -296,6 +296,12 @@ param_groups = [
 ]
 opt = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
+autocast_ctx = (
+    torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    if device_type == "cuda"
+    else nullcontext()
+)
+
 # Mkdir
 if master_process:
     os.makedirs(save_dir, exist_ok=True)
@@ -317,16 +323,14 @@ while step < max_steps:
         x_c, y_c, x_r, y_r, w = make_batch(_rows, tokenizer, max_len, min_prompt, device, pad_id)
         
         # Forward
-        fc = extract_features(backbone, x_c, pad_id)
-        fr = extract_features(backbone, x_r, pad_id)
-        target_dtype = head.fc.weight.dtype
-        fc = fc.to(dtype=target_dtype)
-        fr = fr.to(dtype=target_dtype)
-
-        rc = head(fc)
-        rr = head(fr)
-        loss_vec = bt_loss(rc, rr)
-        loss = apply_weights(loss_vec, w, weight_mode, weight_cap)
+        with autocast_ctx:
+            fc = extract_features(backbone, x_c, pad_id)
+            fr = extract_features(backbone, x_r, pad_id)
+            rc = head(fc)
+            rr = head(fr)
+            loss_vec = bt_loss(rc, rr)
+            loss = apply_weights(loss_vec, w, weight_mode, weight_cap)
+        loss = loss.float()
         
         # Backward
         opt.zero_grad(set_to_none=True)
