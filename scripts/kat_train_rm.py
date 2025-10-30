@@ -23,7 +23,6 @@ from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
@@ -53,9 +52,11 @@ backbone_lr = 5e-5
 weight_decay = 0.0
 max_steps = 1000
 log_every = 25
-eval_every = 25  # steps between validation metrics (-1 = disable)
+eval_every = 100  # steps between validation metrics (-1 = disable)
 val_ratio = 0.05  # fraction of pairs routed to validation split
 val_seed = 123
+likert_token = "7"  # token whose logit scores the completion
+likert_prompt = "\nRating (1-7):"  # appended prompt before scoring the logit
 
 # Data paths and processing
 pairs_path = None  # Auto-resolved
@@ -142,14 +143,6 @@ class PairsDataset(Dataset):
     def __getitem__(self, idx: int) -> PairRow: 
         return self.rows[idx]
 
-class RewardHead(nn.Module):
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.fc = nn.Linear(in_dim, 1, bias=True)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x).squeeze(-1)
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Helper functions
 # ═════════════════════════════════════════════════════════════════════════════
@@ -186,9 +179,12 @@ def make_batch(
 ):
     """Prepare tensors for a minibatch of preference pairs."""
 
-    chosen_token_ids: List[List[int]] = []      # prompt + chosen completion
-    rejected_token_ids: List[List[int]] = []    # prompt + rejected completion
+    chosen_token_ids: List[List[int]] = []      # prompt + chosen completion + rating prompt
+    rejected_token_ids: List[List[int]] = []    # prompt + rejected completion + rating prompt
     example_weights: List[float] = []
+
+    rating_prompt_len = len(tokenizer.encode(likert_prompt))
+    effective_max_len = max(1, max_len - rating_prompt_len)
 
     for row in rows:
         try:
@@ -199,12 +195,17 @@ def make_batch(
         chosen_ids = tokenizer.encode(row.chosen)
         rejected_ids = tokenizer.encode(row.rejected)
 
-        prompt_chosen_ids, chosen_trimmed = truncate_two(prompt_ids, chosen_ids, max_len, min_prompt)
-        prompt_rejected_ids, rejected_trimmed = truncate_two(prompt_ids, rejected_ids, max_len, min_prompt)
+        prompt_chosen_ids, chosen_trimmed = truncate_two(prompt_ids, chosen_ids, effective_max_len, min_prompt)
+        prompt_rejected_ids, rejected_trimmed = truncate_two(prompt_ids, rejected_ids, effective_max_len, min_prompt)
 
-        # Model inputs are prompt followed by completion tokens. Labels ignore the prompt portion.
-        chosen_token_ids.append(prompt_chosen_ids + chosen_trimmed)
-        rejected_token_ids.append(prompt_rejected_ids + rejected_trimmed)
+        chosen_sequence = prompt_chosen_ids + chosen_trimmed + tokenizer.encode(likert_prompt)
+        rejected_sequence = prompt_rejected_ids + rejected_trimmed + tokenizer.encode(likert_prompt)
+
+        assert len(chosen_sequence) <= max_len, "Chosen sequence exceeds max_len after rating prompt append"
+        assert len(rejected_sequence) <= max_len, "Rejected sequence exceeds max_len after rating prompt append"
+
+        chosen_token_ids.append(chosen_sequence)
+        rejected_token_ids.append(rejected_sequence)
         example_weights.append(row.weight)
 
     def pad_sequences(seqs: List[List[int]]) -> torch.Tensor:
@@ -217,19 +218,6 @@ def make_batch(
         pad_sequences(rejected_token_ids),
         torch.tensor(example_weights, dtype=torch.float32, device=device),
     )
-
-@torch.no_grad()
-def extract_features(backbone, x: torch.Tensor, pad_id: int) -> torch.Tensor:
-    """
-    Extract last non-pad HIDDEN STATE as features: [B, H].
-    Assumes backbone(..., return_hidden_states=True) returns {'hidden_states': [B,T,H]}.
-    """
-    attn = (x != pad_id)
-    out = backbone(x, return_hidden_states=True)
-    H = out["hidden_states"]            # [B,T,H]
-    idx = attn.long().sum(dim=1).clamp(min=1) - 1
-    b = torch.arange(x.size(0), device=x.device)
-    return H[b, idx, :]                 # [B,H]
 
 def bt_loss(reward_ch: torch.Tensor, reward_rj: torch.Tensor) -> torch.Tensor:
     """Bradley–Terry pairwise loss."""
@@ -289,7 +277,6 @@ def split_pair_rows(
 
 def evaluate_reward_model(
     backbone,
-    head,
     loader,
     tokenizer,
     pad_id: int,
@@ -299,35 +286,32 @@ def evaluate_reward_model(
     max_len: int,
     min_prompt: int,
     device: torch.device,
+    label_token_id: int,
 ) -> Tuple[float, float]:
     losses: List[float] = []
     margins: List[float] = []
 
     backbone_was_training = backbone.training
-    head_was_training = head.training
     backbone.eval()
-    head.eval()
 
     with torch.no_grad():
-    for rows in loader:
-        chosen_input_ids, rejected_input_ids, example_weights = make_batch(
-            rows, tokenizer, max_len, min_prompt, device, pad_id
-        )
+        for rows in loader:
+            chosen_input_ids, rejected_input_ids, example_weights = make_batch(
+                rows, tokenizer, max_len, min_prompt, device, pad_id
+            )
             with autocast_ctx:
-            chosen_features = extract_features(backbone, chosen_input_ids, pad_id)
-            rejected_features = extract_features(backbone, rejected_input_ids, pad_id)
-            chosen_rewards = head(chosen_features)
-            rejected_rewards = head(rejected_features)
+                chosen_logits = backbone(chosen_input_ids)[:, -1, :]
+                rejected_logits = backbone(rejected_input_ids)[:, -1, :]
+                chosen_rewards = chosen_logits[:, label_token_id]
+                rejected_rewards = rejected_logits[:, label_token_id]
             reward_margins = chosen_rewards - rejected_rewards
             loss_vec = F.softplus(-reward_margins)
             loss = apply_weights(loss_vec, example_weights, weight_mode, weight_cap)
-        losses.append(loss.float().item())
-        margins.append(reward_margins.float().mean().item())
+            losses.append(loss.float().item())
+            margins.append(reward_margins.float().mean().item())
 
     if backbone_was_training:
         backbone.train()
-    if head_was_training:
-        head.train()
 
     if not losses:
         return float("nan"), float("nan")
@@ -358,6 +342,12 @@ backbone, tokenizer, _ = load_model(source="sft", device=device, phase="eval")
 backbone.train()
 for p in backbone.parameters():
     p.requires_grad_(False)
+
+likert_token_ids = tokenizer.encode(likert_token)
+assert len(likert_token_ids) == 1, f"Likert token '{likert_token}' must map to a single token"
+label_token_id = likert_token_ids[0]
+rating_prompt_ids = tokenizer.encode(likert_prompt)
+assert len(rating_prompt_ids) > 0, "Likert rating prompt must produce at least one token"
 
 # Unfreeze the final transformer blocks for joint training with the RM head
 trainable_block_indices = [-2, -1]
@@ -419,12 +409,8 @@ if val_ds is not None:
         collate_fn=lambda batch: batch,
     )
 
-# Reward head
-print0(f"Building RewardHead with input_dim={hidden_size}...")
-head = RewardHead(in_dim=hidden_size).to(device)
-param_groups = [
-    {"params": head.parameters(), "lr": learning_rate},
-]
+# Optimizer (policy head will be LM logit, so we only optimize unfrozen blocks)
+param_groups = []
 for _, block in trainable_blocks:
     param_groups.append({"params": block.parameters(), "lr": backbone_lr})
 opt = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
@@ -459,14 +445,12 @@ while step < max_steps:
         
         # Forward
         with autocast_ctx:
-            chosen_features = extract_features(backbone, chosen_input_ids, pad_id)
-            rejected_features = extract_features(backbone, rejected_input_ids, pad_id)
+            chosen_logits = backbone(chosen_input_ids)[:, -1, :]
+            rejected_logits = backbone(rejected_input_ids)[:, -1, :]
 
-            # Reward scores for each branch
-            chosen_rewards = head(chosen_features)
-            rejected_rewards = head(rejected_features)
+            chosen_rewards = chosen_logits[:, label_token_id]
+            rejected_rewards = rejected_logits[:, label_token_id]
 
-            # Bradley–Terry loss: L = E[ log(1 + exp(-(r_chosen - r_rejected))) ]
             reward_margins = chosen_rewards - rejected_rewards
             loss_vec = F.softplus(-reward_margins)
             loss = apply_weights(loss_vec, example_weights, weight_mode, weight_cap)
@@ -475,10 +459,11 @@ while step < max_steps:
         # Backward
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        clip_params = list(head.parameters())
+        clip_params = []
         for _, block in trainable_blocks:
             clip_params.extend(block.parameters())
-        torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+        if clip_params:
+            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
         opt.step()
         
         # Logging
@@ -510,7 +495,6 @@ while step < max_steps:
         if val_dl is not None and eval_every > 0 and (step % eval_every == 0 or step == max_steps):
             val_loss, val_margin = evaluate_reward_model(
                 backbone,
-                head,
                 val_dl,
                 tokenizer,
                 pad_id,
@@ -520,6 +504,7 @@ while step < max_steps:
                 max_len,
                 min_prompt,
                 device,
+                label_token_id,
             )
             wandb_run.log({
                 "step": step,
@@ -531,10 +516,8 @@ while step < max_steps:
 # Checkpoint
 if master_process:
     ckpt = {
-        "rm_head_state_dict": head.state_dict(),
         "backbone_blocks_state_dict": {str(idx): block.state_dict() for idx, block in trainable_blocks},
         "meta": {
-            "features_dim": hidden_size,  # <-- matches hidden states
             "weight_mode": weight_mode,
             "weight_cap": weight_cap,
             "density_aware": density_aware,
@@ -546,11 +529,13 @@ if master_process:
             "learning_rate": learning_rate,
             "val_ratio": val_ratio,
             "val_seed": val_seed,
+            "likert_token": likert_token,
+            "likert_prompt": likert_prompt,
         }
     }
     out_path = Path(save_dir) / f"model_{int(time.time())}.pt"
     torch.save(ckpt, out_path)
-    print0(f"✓ Saved RM head to {out_path}")
+    print0(f"✓ Saved reward checkpoint to {out_path}")
 
 wandb_run.finish()
 compute_cleanup()

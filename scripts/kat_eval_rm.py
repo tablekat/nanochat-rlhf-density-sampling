@@ -45,16 +45,6 @@ def truncate_two(p: List[int], r: List[int], max_len: int, min_prompt: int) -> T
     return p, r
 
 
-@torch.no_grad()
-def extract_features(backbone, x: torch.Tensor, pad_id: int) -> torch.Tensor:
-    attn = (x != pad_id)
-    out = backbone(x, return_hidden_states=True)
-    hidden = out["hidden_states"]
-    idx = attn.long().sum(dim=1).clamp(min=1) - 1
-    batch_idx = torch.arange(x.size(0), device=x.device)
-    return hidden[batch_idx, idx, :]
-
-
 class RewardHead(nn.Module):
     def __init__(self, in_dim: int):
         super().__init__()
@@ -234,16 +224,15 @@ def find_latest_checkpoint(directory: Path) -> Path:
     return max(ckpts, key=lambda p: int(Path(p).stem.split("_")[1]))
 
 
-def load_reward_heads(
+def load_reward_configs(
     sources: List[str],
-    device: torch.device,
-) -> List[Tuple[str, RewardHead, Dict[str, torch.Tensor], Path, List[int], Dict[str, torch.Tensor]]]:
+) -> List[Tuple[str, Path, Dict[str, object], List[int], Dict[str, torch.Tensor]]]:
     base = Path(get_base_dir())
     mapping = {
         "rm": base / "rm_checkpoints" / "uniform" / "d20",
         "rm_density": base / "rm_checkpoints" / "density" / "d20",
     }
-    heads = []
+    configs = []
     for source in sources:
         if source not in mapping:
             raise ValueError(f"Unknown rm_source '{source}'")
@@ -251,10 +240,6 @@ def load_reward_heads(
         ckpt_path = find_latest_checkpoint(directory)
         ckpt = torch.load(ckpt_path, map_location="cpu")
         meta = ckpt.get("meta", {})
-        feat_dim = int(meta.get("features_dim"))
-        head = RewardHead(feat_dim).to(device)
-        head.load_state_dict(ckpt["rm_head_state_dict"])
-        head.eval()
         blocks_state = ckpt.get("backbone_blocks_state_dict")
         if blocks_state is None:
             # Backwards compatibility with single-block checkpoints
@@ -265,8 +250,8 @@ def load_reward_heads(
             block_indices = [block_idx]
         else:
             block_indices = meta.get("backbone_block_indices", [int(k) for k in blocks_state.keys()])
-        heads.append((source, head, meta, Path(ckpt_path), block_indices, blocks_state or {}))
-    return heads
+        configs.append((source, Path(ckpt_path), meta, block_indices, blocks_state or {}))
+    return configs
 
 
 # -----------------------------------------------------------------------------
@@ -301,14 +286,14 @@ def evaluate(args):
 
     print(f"Loaded {len(rows)} evaluation pairs")
 
-    heads = load_reward_heads(args.rm_sources.split(","), device)
+    reward_configs = load_reward_configs(args.rm_sources.split(","))
 
     batch_size = args.batch_size
     max_len = args.max_len
     min_prompt = args.min_prompt
 
     summaries = {}
-    for name, head, meta, ckpt_path, block_indices, blocks_state in heads:
+    for name, ckpt_path, meta, block_indices, blocks_state in reward_configs:
         print(f"Evaluating reward model '{name}' from {ckpt_path}")
         backbone, tokenizer, _ = load_model("sft", device=device, phase="eval")
         backbone.eval()
@@ -322,49 +307,45 @@ def evaluate(args):
                 backbone.transformer.h[idx].load_state_dict(state)
         pad_id = tokenizer.encode_special("<|assistant_end|>")
 
+        likert_token = meta.get("likert_token", "7")
+        likert_prompt = meta.get("likert_prompt", "\nRating (1-7):")
+        likert_token_ids = tokenizer.encode(likert_token)
+        if len(likert_token_ids) != 1:
+            raise ValueError(f"Likert token '{likert_token}' must map to a single token")
+        likert_token_id = likert_token_ids[0]
+        rating_prompt_ids = tokenizer.encode(likert_prompt)
+        if not rating_prompt_ids:
+            raise ValueError("Likert rating prompt must produce tokens")
+
         metric = Metrics(name)
 
         for start in tqdm(range(0, len(rows), batch_size), desc=f"{name} eval"):
             batch = rows[start:start + batch_size]
-            pcs, prs = [], []
             sources, weights, bins = [], [], []
-
             for row in batch:
-                try:
-                    prompt_tokens = render_prefix_for_completion(tokenizer, row.prefix)
-                except ValueError:
-                    prompt_tokens = render_prefix_for_completion(tokenizer, None)
-                chosen_ids = tokenizer.encode(row.chosen)
-                rejected_ids = tokenizer.encode(row.rejected)
-                p1, c1 = truncate_two(prompt_tokens, chosen_ids, max_len, min_prompt)
-                p2, r2 = truncate_two(prompt_tokens, rejected_ids, max_len, min_prompt)
-                pcs.append(p1 + c1)
-                prs.append(p2 + r2)
                 sources.append(row.src)
                 weights.append(row.weight)
                 bins.append(row.weight_bin)
 
-            if not pcs:
-                continue
-
-            def pad_sequences(seq_list: List[List[int]]) -> torch.Tensor:
-                seq_list = [seq[:max_len] for seq in seq_list]
-                max_seq = max(len(seq) for seq in seq_list)
-                padded = [seq + [pad_id] * (max_seq - len(seq)) for seq in seq_list]
-                return torch.tensor(padded, dtype=torch.long, device=device)
-
-            x_c = pad_sequences(pcs)
-            x_r = pad_sequences(prs)
+            x_c, x_r = build_reward_inputs(
+                batch,
+                tokenizer,
+                max_len,
+                min_prompt,
+                device,
+                pad_id,
+                rating_prompt_ids,
+            )
 
             with torch.no_grad():
-                feat_c = extract_features(backbone, x_c, pad_id)
-                feat_r = extract_features(backbone, x_r, pad_id)
-                rc = head(feat_c)
-                rr = head(feat_r)
-                margin = (rc - rr).detach().cpu().numpy()
+                logits_c = backbone(x_c)[:, -1, :]
+                logits_r = backbone(x_r)[:, -1, :]
+                rewards_c = logits_c[:, likert_token_id]
+                rewards_r = logits_r[:, likert_token_id]
+                margins = (rewards_c - rewards_r).detach().cpu().numpy()
 
-            correct = margin > 0
-            for src, bin_label, ok, m, w in zip(sources, bins, correct, margin, weights):
+            correct = margins > 0
+            for src, bin_label, ok, m, w in zip(sources, bins, correct, margins, weights):
                 metric.add(src, bin_label, bool(ok), float(m), float(w))
 
         summaries[name] = metric.summarize()

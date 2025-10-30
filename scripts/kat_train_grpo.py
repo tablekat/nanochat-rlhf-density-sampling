@@ -24,7 +24,6 @@ import glob
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
@@ -111,14 +110,6 @@ class Pairs(Dataset):
     def __getitem__(self, i):
         return self.xs[i]
 
-class RewardHead(nn.Module):
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.fc = nn.Linear(in_dim, 1, bias=True)
-    
-    def forward(self, x):
-        return self.fc(x).squeeze(-1)
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Helper functions
 # ═════════════════════════════════════════════════════════════════════════════
@@ -134,6 +125,45 @@ def truncate_two(p: List[int], r: List[int], max_len: int, min_prompt: int):
     if over > 0:
         p = p[over:]
     return p, r
+
+
+def build_reward_inputs(
+    rows: List[PairRow],
+    tokenizer,
+    max_len: int,
+    min_prompt: int,
+    device,
+    pad_id: int,
+    rating_prompt_ids: List[int],
+):
+    rating_prompt_len = len(rating_prompt_ids)
+    effective_max_len = max(1, max_len - rating_prompt_len)
+
+    chosen_sequences, rejected_sequences = [], []
+
+    for row in rows:
+        try:
+            prompt_ids = render_prefix_for_completion(tokenizer, row.prefix)
+        except ValueError:
+            prompt_ids = render_prefix_for_completion(tokenizer, None)
+
+        chosen_ids = tokenizer.encode(row.chosen)
+        rejected_ids = tokenizer.encode(row.rejected)
+
+        prompt_chosen_ids, chosen_trimmed = truncate_two(prompt_ids, chosen_ids, effective_max_len, min_prompt)
+        prompt_rejected_ids, rejected_trimmed = truncate_two(prompt_ids, rejected_ids, effective_max_len, min_prompt)
+
+        chosen_sequence = prompt_chosen_ids + chosen_trimmed + rating_prompt_ids
+        rejected_sequence = prompt_rejected_ids + rejected_trimmed + rating_prompt_ids
+        chosen_sequences.append(chosen_sequence)
+        rejected_sequences.append(rejected_sequence)
+
+    def pad_sequences(seqs: List[List[int]]):
+        seqs = [seq[:max_len] for seq in seqs]
+        padded = [seq + [pad_id] * (max_len - len(seq)) for seq in seqs]
+        return torch.tensor(padded, dtype=torch.long, device=device)
+
+    return pad_sequences(chosen_sequences), pad_sequences(rejected_sequences)
 
 def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, device):
     """Collate preference pairs into batch tensors."""
@@ -173,16 +203,6 @@ def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, devic
         return torch.tensor([l + [-100]*(max_len - len(l)) for l in ls], dtype=torch.long, device=device)
     
     return pad_to(pcs), pad_lab(ccs), pad_to(prs), pad_lab(rrs)
-
-@torch.no_grad()
-def last_features(backbone, x: torch.Tensor, pad_id: int) -> torch.Tensor:
-    """Extract last non-pad hidden state [B,H] as RM features."""
-    attn = (x != pad_id)
-    out = backbone(x, return_hidden_states=True)
-    H = out["hidden_states"]            # [B,T,H]
-    idx = attn.long().sum(dim=1).clamp(min=1) - 1
-    b = torch.arange(x.size(0), device=x.device)
-    return H[b, idx, :]                 # [B,H]
 
 def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum log-probs over response tokens (teacher forcing)."""
@@ -236,7 +256,7 @@ for p in reference.parameters():
     p.requires_grad_(False)
 
 # RM head
-print0(f"Loading RM head from {rm_ckpt_dir}...")
+print0(f"Loading reward model from {rm_ckpt_dir}...")
 rm_ckpt_files = glob.glob(os.path.join(rm_ckpt_dir, "model_*.pt"))
 if not rm_ckpt_files:
     raise FileNotFoundError(f"No RM checkpoint found in {rm_ckpt_dir}")
@@ -244,10 +264,10 @@ rm_head_path = max(rm_ckpt_files, key=lambda x: int(Path(x).stem.split("_")[1]))
 print0(f"Using RM checkpoint: {rm_head_path}")
 
 rm = torch.load(rm_head_path, map_location="cpu")
-head = RewardHead(in_dim=rm["meta"]["features_dim"]).to(device)
-head.load_state_dict(rm["rm_head_state_dict"])
-for p_ in head.parameters():
-    p_.requires_grad_(False)
+# head = RewardHead(in_dim=rm["meta"]["features_dim"]).to(device) # Removed RewardHead
+# head.load_state_dict(rm["rm_head_state_dict"]) # Removed RewardHead
+# for p_ in head.parameters(): # Removed RewardHead
+#     p_.requires_grad_(False) # Removed RewardHead
 
 # If RM training also fine-tuned transformer blocks, load them into policy/reference
 blocks_state = rm.get("backbone_blocks_state_dict")
@@ -266,11 +286,18 @@ if blocks_state is not None:
         policy.transformer.h[idx].load_state_dict(state)
         reference.transformer.h[idx].load_state_dict(state)
 
-# Dataset
-print0(f"Loading preference dataset...")
+likert_token = rm.get("meta", {}).get("likert_token", "7")
+likert_prompt = rm.get("meta", {}).get("likert_prompt", "\nRating (1-7):")
+
 tokenizer = get_tokenizer()
 ds = Pairs(Path(pairs_path))
 pad_id = tokenizer.encode_special("<|assistant_end|>")
+
+likert_token_ids = tokenizer.encode(likert_token)
+assert len(likert_token_ids) == 1, f"Likert token '{likert_token}' must map to a single token"
+likert_token_id = likert_token_ids[0]
+rating_prompt_ids = tokenizer.encode(likert_prompt)
+assert len(rating_prompt_ids) > 0, "Likert rating prompt must produce tokens"
 
 sampler = DistributedSampler(ds, shuffle=True) if ddp else None
 dl = DataLoader(
@@ -278,7 +305,7 @@ dl = DataLoader(
     batch_size=batch_size,
     shuffle=(sampler is None),
     sampler=sampler,
-    num_workers=2,
+    num_workers=0,
     pin_memory=True,
     drop_last=True,
     collate_fn=lambda batch: batch,
@@ -307,7 +334,8 @@ while step < max_steps:
             break
         
         x_c, y_c, x_r, y_r = collate(rows, tokenizer, max_len, min_prompt, device)
-        
+        rm_x_c, rm_x_r = build_reward_inputs(rows, tokenizer, max_len, min_prompt, device, pad_id, rating_prompt_ids)
+
         # Log-probs (response-only)
         lp_c = sum_logprobs(policy, x_c, y_c)
         lp_r = sum_logprobs(policy, x_r, y_r)
@@ -318,10 +346,10 @@ while step < max_steps:
         
         # Rewards (frozen backbone + RM head)
         with torch.no_grad():
-            fc = last_features(reference, x_c, pad_id)
-            fr = last_features(reference, x_r, pad_id)
-            rc = head(fc)
-            rr = head(fr)
+            logits_c = reference(rm_x_c)[:, -1, :]
+            logits_r = reference(rm_x_r)[:, -1, :]
+            rc = logits_c[:, likert_token_id]
+            rr = logits_r[:, likert_token_id]
         
         # Advantage and loss
         dr = (rc - rr)
