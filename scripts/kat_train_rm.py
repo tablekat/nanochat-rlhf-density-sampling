@@ -16,7 +16,7 @@ Design notes:
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-import json, math, time, hashlib
+import json, math, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -31,6 +31,12 @@ import wandb
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, autodetect_device_type, get_base_dir, print_banner
 from nanochat.checkpoint_manager import load_model
 from nanochat.tokenizer import get_tokenizer
+
+from scripts.kat_utils import (
+    ensure_prefix_dict,
+    prefix_id_from_prefix,
+    render_prefix_for_completion,
+)
 
 print_banner()
 
@@ -81,49 +87,35 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rm
 # Utilities & Data structures
 # ═════════════════════════════════════════════════════════════════════════════
 
-def md5_16(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()[:16]
-
 @dataclass
 class PairRow:
     prefix: dict  # NEW: Full conversation object
     chosen: str
     rejected: str
     weight: float
+    prefix_id: Optional[str] = None
 
 class PairsDataset(Dataset):
     def __init__(self, pairs_path: Path, density: Optional[Dict[str, float]]):
         self.rows: List[PairRow] = []
-        self.tokenizer = get_tokenizer()  # For render_for_completion
         
         with pairs_path.open("r", encoding="utf-8") as f:
             for line in f:
                 ex = json.loads(line)
-                w = 1.0
-                
-                # Extract prompt ID for density weighting
-                if 'prefix' in ex and isinstance(ex['prefix'], dict):
-                    # New format: extract first user message
-                    messages = ex['prefix'].get('messages', [])
-                    prompt_id_str = None
-                    for msg in messages:
-                        if msg.get('role') == 'user':
-                            prompt_id_str = md5_16(msg.get('content', ''))
-                            break
-                elif 'prompt' in ex:
-                    # Old format: direct prompt
-                    prompt_id_str = md5_16(ex["prompt"])
-                else:
-                    continue
-                
-                if density is not None and prompt_id_str:
-                    w = float(density.get(prompt_id_str, 1.0))
-                
+
+                prefix = ensure_prefix_dict(ex.get("prefix"))
+                prefix_id = ex.get("prefix_id") or prefix_id_from_prefix(prefix)
+                weight = 1.0
+
+                if density is not None and prefix_id:
+                    weight = float(density.get(prefix_id, 1.0))
+
                 self.rows.append(PairRow(
-                    prefix=ex.get("prefix", {"messages": []}),
+                    prefix=prefix,
                     chosen=ex["chosen"],
                     rejected=ex["rejected"],
-                    weight=w
+                    weight=weight,
+                    prefix_id=prefix_id,
                 ))
     
     def __len__(self): 
@@ -173,12 +165,10 @@ def make_batch(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, de
     
     for row in rows:
         # NEW: Handle prefix conversation object using render_for_completion
-        if isinstance(row.prefix, dict) and 'messages' in row.prefix:
-            # Use render_for_completion to get tokens including <|assistant_start|>
-            p = tokenizer.render_for_completion(row.prefix)
-        else:
-            # Fallback for old format (should not happen with new kat_download_pairs)
-            p = tokenizer.encode("")
+        try:
+            p = render_prefix_for_completion(tokenizer, row.prefix)
+        except ValueError:
+            p = render_prefix_for_completion(tokenizer, None)
         
         c = tokenizer.encode(row.chosen)
         r = tokenizer.encode(row.rejected)

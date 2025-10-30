@@ -14,7 +14,9 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from nanochat.model import Transformer
-from nanochat.tokenizer import Tokenizer
+from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
+
+from scripts.kat_utils import ensure_prefix_dict, render_prefix_for_completion
 
 class Pairset(Dataset):
     def __init__(self, path, tok, max_len=2048):
@@ -29,20 +31,15 @@ class Pairset(Dataset):
         
         NEW: prefix_obj is now a full conversation object {"messages": [...]}
         """
-        if isinstance(prefix_obj, dict) and 'messages' in prefix_obj:
-            # New format: use render_for_completion to get prefix tokens
-            prefix_ids = self.tok.render_for_completion(prefix_obj)
-            answer_ids = self.tok.encode(answer)
-            assistant_end = self.tok.encode_special("<|assistant_end|>")
-            return (prefix_ids + answer_ids + assistant_end)[: self.max_len]
-        else:
-            # Fallback to old manual format (backward compatibility)
-            text = (
-                "<|bos|>\n<|user_start|>" + str(prefix_obj) + "<|user_end|>\n" +
-                "<|assistant_start|>" + answer + "<|assistant_end|>\n"
-            )
-            ids = self.tok.encode(text, add_bos=False, add_eos=True)
-            return ids[: self.max_len]
+        try:
+            prefix_dict = ensure_prefix_dict(prefix_obj)
+            prefix_ids = render_prefix_for_completion(self.tok, prefix_dict)
+        except ValueError:
+            prefix_ids = render_prefix_for_completion(self.tok, None)
+
+        answer_ids = self.tok.encode(answer)
+        assistant_end = self.tok.encode_special("<|assistant_end|>")
+        return (prefix_ids + answer_ids + assistant_end)[: self.max_len]
 
     def __getitem__(self, i):
         r = self.rows[i]
@@ -91,7 +88,12 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    tok = Tokenizer(args.tokenizer)
+    if args.tokenizer and os.path.isdir(args.tokenizer):
+        tok = RustBPETokenizer.from_directory(args.tokenizer)
+    else:
+        if args.tokenizer and not os.path.isdir(args.tokenizer):
+            print(f"Warning: tokenizer path '{args.tokenizer}' not found or not a directory; using default tokenizer")
+        tok = get_tokenizer()
 
     ds = Pairset(args.pairs, tok)
     dl = DataLoader(ds, batch_size=args.bsz, shuffle=True,

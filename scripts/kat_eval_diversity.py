@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import re
 import sys
 from collections import Counter
@@ -39,49 +40,92 @@ from tqdm import tqdm
 from nanochat.checkpoint_manager import load_model, get_base_dir
 from nanochat.tokenizer import get_tokenizer
 
+from scripts.kat_utils import ensure_prefix_dict, render_prefix_for_completion
 
-def generate_samples(model_source, num_samples=50, prompts=None, device="cpu"):
-    """Generate text samples from a model using checkpoint_manager."""
-    if prompts is None:
-        prompts = [
-            "Explain quantum computing",
-            "What is machine learning?",
-            "How does photosynthesis work?",
-            "What is the meaning of life?",
-            "How do neural networks work?",
+
+def load_prefix_conversations(num_samples, seed=42):
+    """Load prefix conversations for evaluation."""
+
+    base_dir = get_base_dir()
+    prefixes_path = os.path.join(base_dir, "data", "prefixes_all.jsonl")
+
+    default_prompts = [
+        "Explain quantum computing",
+        "What is machine learning?",
+        "How does photosynthesis work?",
+        "What is the meaning of life?",
+        "How do neural networks work?",
+    ]
+
+    rows = []
+    if os.path.exists(prefixes_path):
+        with open(prefixes_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                    rows.append({
+                        "id": obj.get("id"),
+                        "prefix": ensure_prefix_dict(obj.get("prefix")),
+                    })
+                except json.JSONDecodeError:
+                    continue
+
+    if not rows:
+        # Fallback to legacy text prompts if prefixes are unavailable
+        limited = default_prompts[:num_samples] if num_samples else default_prompts
+        return [
+            {
+                "id": f"default_{idx}",
+                "prefix": ensure_prefix_dict(prompt),
+            }
+            for idx, prompt in enumerate(limited)
         ]
-    
+
+    if num_samples and num_samples < len(rows):
+        rng = random.Random(seed)
+        rows = rng.sample(rows, num_samples)
+    elif num_samples:
+        rows = rows[:num_samples]
+
+    return rows
+
+
+def generate_samples(model_source, prefixes, device="cpu", max_tokens=128, temperature=0.8, top_k=50):
+    """Generate assistant responses for the provided prefixes."""
+
     try:
         print(f"Loading model from {model_source}...")
         model, tokenizer, _ = load_model(model_source, device=device, phase="eval")
         model.eval()
-        print(f"✓ Model loaded successfully")
-        
+        print("✓ Model loaded successfully")
+
+        assistant_end_id = tokenizer.encode_special("<|assistant_end|>")
+
         samples = []
-        with torch.no_grad():
-            for i, prompt in enumerate(prompts[:num_samples]):
-                # Encode prompt
-                prompt_ids = tokenizer.encode(prompt)
-                
-                # Generate text using model's generate method
-                generated_ids = list(model.generate(
-                    prompt_ids,
-                    max_tokens=100,
-                    temperature=0.8,
-                    top_k=50,
-                    seed=42 + i
-                ))
-                
-                # Decode to text
-                full_ids = prompt_ids + generated_ids
-                generated_text = tokenizer.decode(full_ids)
-                samples.append(generated_text)
-                
-                if (i + 1) % 10 == 0:
-                    print(f"  Generated {i + 1}/{num_samples} samples")
-        
+        for idx, item in enumerate(prefixes):
+            prefix_tokens = render_prefix_for_completion(tokenizer, item["prefix"])
+            prompt_ids = list(prefix_tokens)  # copy to avoid accidental mutation
+
+            generated_ids = []
+            for token in model.generate(
+                prompt_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                seed=42 + idx,
+            ):
+                if token == assistant_end_id:
+                    break
+                generated_ids.append(token)
+
+            text = tokenizer.decode(generated_ids) if generated_ids else ""
+            samples.append((item["id"], text))
+
+            if (idx + 1) % 10 == 0:
+                print(f"  Generated {idx + 1}/{len(prefixes)} samples")
+
         return samples
-        
+
     except Exception as e:
         print(f"Error generating samples: {e}")
         import traceback
@@ -148,9 +192,17 @@ def analyze_text(text):
 
 
 def compare_models(density_samples, baseline_samples):
-    """Compare metrics between two sets of samples."""
-    density_metrics = [analyze_text(s) for s in density_samples]
-    baseline_metrics = [analyze_text(s) for s in baseline_samples]
+    """Compare metrics between two sets of samples aligned by prefix id."""
+
+    density_map = {pid: text for pid, text in density_samples}
+    baseline_map = {pid: text for pid, text in baseline_samples}
+
+    shared_ids = [pid for pid in density_map if pid in baseline_map]
+    if not shared_ids:
+        raise ValueError("No overlapping prefixes between model samples")
+
+    density_metrics = [analyze_text(density_map[pid]) for pid in shared_ids]
+    baseline_metrics = [analyze_text(baseline_map[pid]) for pid in shared_ids]
     
     # Average metrics
     density_avg = {k: sum(m[k] for m in density_metrics) / len(density_metrics) 
@@ -176,7 +228,7 @@ def compare_models(density_samples, baseline_samples):
             'percent_change': pct_diff,
         }
     
-    return improvements
+    return improvements, shared_ids
 
 
 def generate_report(improvements, output_path=None):
@@ -351,12 +403,19 @@ def main():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    prefixes = load_prefix_conversations(args.num_prompts)
+    if not prefixes:
+        print("❌ No prefixes available for evaluation")
+        sys.exit(1)
+
+    print(f"Using {len(prefixes)} prefixes for evaluation")
+
     # Generate real samples from both models
     print(f"Generating samples from density-aware model ({args.density_model_source})...")
-    density_samples = generate_samples(args.density_model_source, args.num_prompts, device=device)
+    density_samples = generate_samples(args.density_model_source, prefixes, device=device)
     
     print(f"\nGenerating samples from baseline model ({args.baseline_model_source})...")
-    baseline_samples = generate_samples(args.baseline_model_source, args.num_prompts, device=device)
+    baseline_samples = generate_samples(args.baseline_model_source, prefixes, device=device)
     
     # Validate that we got real samples
     if not density_samples or not baseline_samples:
@@ -373,7 +432,8 @@ def main():
     print("")
     
     # Compare models
-    improvements = compare_models(density_samples, baseline_samples)
+    improvements, shared_ids = compare_models(density_samples, baseline_samples)
+    print(f"Comparing {len(shared_ids)} shared prefixes")
     
     # Generate report
     print("Generating report...")

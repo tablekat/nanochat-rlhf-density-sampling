@@ -57,9 +57,12 @@ bash runpod.sh
 source .venv/bin/activate
 export NANOCHAT_BASE_DIR=/workspace/nanochat
 export WANDB_RUN=density_experiment
+
 bash kat_speedrun.sh
 
 # fucking wandb: https://wandb.ai/authorize
+# aws bucket/folder: kat-runpod-nanochat/nanochat
+# ^ but maybe i should do kat-runpod-nanochat/nanochat/nanochat to /workspace/nanochat instead so it doesnt get .cache.
 
 ```
 

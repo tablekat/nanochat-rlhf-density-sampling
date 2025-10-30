@@ -32,13 +32,11 @@ import argparse, os, uuid, re, json, sys
 from datasets import load_dataset
 from nanochat.common import get_base_dir
 
+from scripts.kat_utils import norm_space, prefix_id_from_prefix
+
 base_dir = get_base_dir()
 OUT_DIR = os.path.join(base_dir, "data")
 OUT_PATH = os.path.join(OUT_DIR, "pairs_all.jsonl")
-
-def norm_space(s: str) -> str:
-    # normalize whitespace for better dedup/join later
-    return re.sub(r"\s+", " ", s.strip())
 
 def write_jsonl(rows, fout):
     for r in rows:
@@ -154,13 +152,17 @@ def from_hh():
             prefix, chosen_response, rejected_response = extract_pairs_and_prefix(chosen_text, rejected_text)
             
             if prefix and chosen_response and rejected_response:
-                yield {
+                row = {
                     "id": str(uuid.uuid4()),
                     "prefix": prefix,
                     "chosen": norm_space(chosen_response),
                     "rejected": norm_space(rejected_response),
                     "src": "hh-rlhf",
                 }
+                prefix_id = prefix_id_from_prefix(prefix)
+                if prefix_id:
+                    row["prefix_id"] = prefix_id
+                yield row
 
 def from_ultrafeedback_binarized():
     ds = load_dataset("HuggingFaceH4/ultrafeedback_binarized")
@@ -174,13 +176,17 @@ def from_ultrafeedback_binarized():
                     {"role": "user", "content": norm_space(p)}
                 ]
             }
-            yield {
+            row = {
                 "id": str(uuid.uuid4()),
                 "prefix": prefix,
                 "chosen": norm_space(c),
                 "rejected": norm_space(rej),
                 "src": "ultrafeedback-binarized",
             }
+            prefix_id = prefix_id_from_prefix(prefix)
+            if prefix_id:
+                row["prefix_id"] = prefix_id
+            yield row
 
 def strip_html(s: str) -> str:
     # light HTML -> text for stack-exchange questions
@@ -200,13 +206,17 @@ def from_stack_exchange_prefs():
                     {"role": "user", "content": strip_html(q)}
                 ]
             }
-            yield {
+            row = {
                 "id": str(uuid.uuid4()),
                 "prefix": prefix,
                 "chosen": norm_space(a_win),
                 "rejected": norm_space(a_lose),
                 "src": "stack-exchange-preferences",
             }
+            prefix_id = prefix_id_from_prefix(prefix)
+            if prefix_id:
+                row["prefix_id"] = prefix_id
+            yield row
 
 def main():
     ap = argparse.ArgumentParser()

@@ -17,9 +17,16 @@ Usage:
   python -m scripts.kat_make_prefixes
 """
 
-import os, json, hashlib, re, sys
+import os, json, sys
 from collections import Counter
 from nanochat.common import get_base_dir
+
+from scripts.kat_utils import (
+    ensure_prefix_dict,
+    first_user_message,
+    norm_space,
+    prefix_id_from_prefix,
+)
 
 base_dir = get_base_dir()
 OUT_DIR  = os.path.join(base_dir, "data")
@@ -27,21 +34,6 @@ IN_PATH  = os.path.join(OUT_DIR, "pairs_all.jsonl")
 PREFIXES = os.path.join(OUT_DIR, "prefixes_all.jsonl")
 IDMAP    = os.path.join(OUT_DIR, "prefix_id_map.tsv")
 STATS    = os.path.join(OUT_DIR, "stats.txt")
-
-def norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip())
-
-def pid(prompt: str) -> str:
-    """Generate deterministic ID from first user message."""
-    return hashlib.md5(prompt.encode("utf-8")).hexdigest()[:16]
-
-def extract_first_user_message(prefix_obj: dict) -> str:
-    """Extract first user message from prefix for dedup key."""
-    messages = prefix_obj.get('messages', [])
-    for msg in messages:
-        if msg.get('role') == 'user':
-            return msg.get('content', '')
-    return ''
 
 def main():
     # Validate input file exists
@@ -70,14 +62,14 @@ def main():
             
             # Validate and extract prefix object
             try:
-                if 'prefix' not in r or not isinstance(r['prefix'], dict):
+                if 'prefix' not in r:
                     print(f"⚠️  Warning: Skipping entry without valid 'prefix' field on line {total_pairs}")
                     continue
                 
-                prefix_obj = r['prefix']
+                prefix_obj = ensure_prefix_dict(r['prefix'])
                 
                 # Extract first user message as dedup key
-                first_user_msg = extract_first_user_message(prefix_obj)
+                first_user_msg = first_user_message(prefix_obj)
                 if not first_user_msg:
                     print(f"⚠️  Warning: No user message found in prefix on line {total_pairs}")
                     continue
@@ -90,7 +82,11 @@ def main():
             
             s = r.get("src") or "unknown"
             by_src[s] += 1
-            h = pid(first_user_msg_norm)
+            h = prefix_id_from_prefix(prefix_obj)
+            if not h:
+                print(f"⚠️  Warning: Could not compute prefix id on line {total_pairs}")
+                total_pairs += 1
+                continue
             
             # Skip if we've already seen this prefix (by first user message)
             if h in seen: 

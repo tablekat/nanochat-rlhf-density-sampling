@@ -33,6 +33,8 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, a
 from nanochat.checkpoint_manager import load_model
 from nanochat.tokenizer import get_tokenizer
 
+from scripts.kat_utils import render_prefix_for_completion
+
 print_banner()
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -139,10 +141,10 @@ def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, devic
     
     for r in rows:
         # NEW: Handle prefix conversation object using render_for_completion
-        if isinstance(r.prefix, dict) and 'messages' in r.prefix:
-            p = tokenizer.render_for_completion(r.prefix)
-        else:
-            p = tokenizer.encode("")  # Fallback
+        try:
+            p = render_prefix_for_completion(tokenizer, r.prefix)
+        except ValueError:
+            p = render_prefix_for_completion(tokenizer, None)
         
         c = tokenizer.encode(r.chosen)
         j = tokenizer.encode(r.rejected)
