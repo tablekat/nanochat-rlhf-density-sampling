@@ -55,6 +55,7 @@ pip install transformers huggingface-hub
 pip install hf_transfer
 pip install psutil
 pip install tiktoken
+pip install wandb
 echo "✓ Python packages installed"
 echo ""
 

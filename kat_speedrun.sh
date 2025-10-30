@@ -161,10 +161,12 @@ echo ""
 # Output: $NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/model_*.pt
 echo "  Training RM #1: Regular (uniform sampling)..."
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
-    --rm_source rm \
+    --rm_source=rm \
     --max_steps=1000
 echo "  ✓ RM #1 (uniform) trained"
 echo ""
+
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rm
 
 echo "✓ Reward Models training complete"
 echo ""
@@ -255,13 +257,20 @@ echo "================================================================"
 echo "EVALUATION: Testing Output Quality"
 echo "================================================================"
 echo ""
-echo "Evaluating outputs for diversity indicators..."
-# python -m scripts.kat_eval_diversity \
-#     --model_path outs/grpo_uniform/ckpt.pt \
-#     --output_report .cache/diversity_report.md
+echo "Evaluating reward models and diversity..."
+python -m scripts.kat_eval_rm \
+    --rm-sources rm${ENABLE_DENSITY_RM:+,rm_density} \
+    --max-examples 5000 \
+    --output-json $NANOCHAT_BASE_DIR/metrics/rm_eval.json || true
+
+python -m scripts.kat_eval_diversity \
+    --density_model_source grpo${ENABLE_DENSITY_RM:+_density} \
+    --baseline_model_source grpo \
+    --output_report $NANOCHAT_BASE_DIR/metrics/diversity_report.md || true
 
 echo ""
-echo "Report location: .cache/diversity_report.md"
+echo "RM metrics: $NANOCHAT_BASE_DIR/metrics/rm_eval.json"
+echo "Diversity report: $NANOCHAT_BASE_DIR/metrics/diversity_report.md"
 echo ""
 
 # =============================================================================
@@ -287,7 +296,10 @@ echo "  ✓ \$NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/"
 echo "      (Regular RM with uniform sampling, timestamped)"
 echo "  ✓ \$NANOCHAT_BASE_DIR/grpo_checkpoints/uniform/d20/"
 echo "      (GRPO with regular RM, timestamped)"
-echo "  ✓ .cache/diversity_report.md         (Evaluation results)"
+echo "  ✓ $NANOCHAT_BASE_DIR/metrics/rm_eval.json"
+echo "      (Reward model accuracy & margin metrics)"
+echo "  ✓ $NANOCHAT_BASE_DIR/metrics/diversity_report.md"
+echo "      (Diversity evaluation comparing policies)"
 echo ""
 echo "To enable density-based RM and comparison:"
 echo "  1. Uncomment Stage 6 (Offline Embeddings) in this script"
