@@ -162,7 +162,8 @@ echo ""
 echo "  Training RM #1: Regular (uniform sampling)..."
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
     --rm_source=rm \
-    --max_steps=1000
+    --max_steps=1000 \
+    --run=${WANDB_RUN}_rm_uniform
 echo "  ✓ RM #1 (uniform) trained"
 echo ""
 
@@ -225,7 +226,8 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo
     --grpo_source grpo \
     --max_steps=5000 \
     --learning_rate=1e-5 \
-    --beta=0.1
+    --beta=0.1 \
+    --run=${WANDB_RUN}_grpo_uniform
 
 echo "✓ GRPO with regular RM complete"
 echo ""
@@ -245,7 +247,8 @@ echo ""
 #     --grpo_source grpo_density \
 #     --max_steps=5000 \
 #     --learning_rate=1e-5 \
-#     --beta=0.1
+#     --beta=0.1 \
+#     --run=${WANDB_RUN}_grpo_density
 # 
 # echo "✓ GRPO with density RM complete"
 # echo ""
