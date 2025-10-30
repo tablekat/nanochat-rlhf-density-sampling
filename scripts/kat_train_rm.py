@@ -16,7 +16,7 @@ Design notes:
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-import json, math, time
+import json, math, time, hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -53,7 +53,9 @@ backbone_lr = 5e-5
 weight_decay = 0.0
 max_steps = 1000
 log_every = 25
-eval_every = -1  # -1 = disable
+eval_every = 100  # steps between validation metrics (-1 = disable)
+val_ratio = 0.05  # fraction of pairs routed to validation split
+val_seed = 123
 
 # Data paths and processing
 pairs_path = None  # Auto-resolved
@@ -96,28 +98,43 @@ class PairRow:
     weight: float
     prefix_id: Optional[str] = None
 
+def build_pair_row(ex: Dict, density: Optional[Dict[str, float]]) -> Optional[PairRow]:
+    chosen = ex.get("chosen")
+    rejected = ex.get("rejected")
+    if not chosen or not rejected:
+        return None
+
+    prefix = ensure_prefix_dict(ex.get("prefix"))
+    prefix_id = ex.get("prefix_id") or prefix_id_from_prefix(prefix)
+    weight = 1.0
+    if density is not None and prefix_id:
+        weight = float(density.get(prefix_id, 1.0))
+
+    return PairRow(
+        prefix=prefix,
+        chosen=chosen,
+        rejected=rejected,
+        weight=weight,
+        prefix_id=prefix_id,
+    )
+
+
 class PairsDataset(Dataset):
-    def __init__(self, pairs_path: Path, density: Optional[Dict[str, float]]):
+    def __init__(self, pairs_path: Path, density: Optional[Dict[str, float]], rows: Optional[List[PairRow]] = None):
+        if rows is not None:
+            self.rows = rows
+            return
+
         self.rows: List[PairRow] = []
-        
         with pairs_path.open("r", encoding="utf-8") as f:
             for line in f:
-                ex = json.loads(line)
-
-                prefix = ensure_prefix_dict(ex.get("prefix"))
-                prefix_id = ex.get("prefix_id") or prefix_id_from_prefix(prefix)
-                weight = 1.0
-
-                if density is not None and prefix_id:
-                    weight = float(density.get(prefix_id, 1.0))
-
-                self.rows.append(PairRow(
-                    prefix=prefix,
-                    chosen=ex["chosen"],
-                    rejected=ex["rejected"],
-                    weight=weight,
-                    prefix_id=prefix_id,
-                ))
+                try:
+                    ex = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                row = build_pair_row(ex, density)
+                if row is not None:
+                    self.rows.append(row)
     
     def __len__(self): 
         return len(self.rows)
@@ -225,6 +242,91 @@ def apply_weights(loss_per_ex: torch.Tensor, w: torch.Tensor, mode: str, cap: Op
         wn = w
     return (wn * loss_per_ex).mean()
 
+
+def split_pair_rows(
+    pairs_path: Path,
+    density: Optional[Dict[str, float]],
+    val_ratio: float,
+    seed: int,
+) -> Tuple[List[PairRow], List[PairRow]]:
+    if val_ratio <= 0.0:
+        return [], []
+
+    threshold = int(val_ratio * 1_000_000)
+    threshold = max(0, min(threshold, 1_000_000))
+    if threshold == 0:
+        return [], []
+
+    train_rows: List[PairRow] = []
+    val_rows: List[PairRow] = []
+
+    with pairs_path.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            try:
+                ex = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            row = build_pair_row(ex, density)
+            if row is None:
+                continue
+
+            key = row.prefix_id or f"{seed}_{idx}"
+            digest_input = f"{key}_{seed}".encode("utf-8")
+            digest = int(hashlib.md5(digest_input).hexdigest(), 16) % 1_000_000
+            if digest < threshold:
+                val_rows.append(row)
+            else:
+                train_rows.append(row)
+
+    return train_rows, val_rows
+
+
+def evaluate_reward_model(
+    backbone,
+    head,
+    loader,
+    tokenizer,
+    pad_id: int,
+    weight_mode: str,
+    weight_cap: Optional[float],
+    autocast_ctx,
+    max_len: int,
+    min_prompt: int,
+    device: torch.device,
+) -> Tuple[float, float]:
+    losses: List[float] = []
+    margins: List[float] = []
+
+    backbone_was_training = backbone.training
+    head_was_training = head.training
+    backbone.eval()
+    head.eval()
+
+    with torch.no_grad():
+        for rows in loader:
+            x_c, y_c, x_r, y_r, w = make_batch(rows, tokenizer, max_len, min_prompt, device, pad_id)
+            with autocast_ctx:
+                fc = extract_features(backbone, x_c, pad_id)
+                fr = extract_features(backbone, x_r, pad_id)
+                rc = head(fc)
+                rr = head(fr)
+                loss_vec = bt_loss(rc, rr)
+                loss = apply_weights(loss_vec, w, weight_mode, weight_cap)
+            margin = (rc - rr).mean()
+            losses.append(loss.float().item())
+            margins.append(margin.float().item())
+
+    if backbone_was_training:
+        backbone.train()
+    if head_was_training:
+        head.train()
+
+    if not losses:
+        return float("nan"), float("nan")
+
+    return float(np.mean(losses)), float(np.mean(margins))
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Training
 # ═════════════════════════════════════════════════════════════════════════════
@@ -274,8 +376,16 @@ if density_aware:
     prefixes_path = os.path.join(base, "data", "prefixes_all.jsonl")
     density = load_density_mapping(Path(prefixes_path), Path(density_weights_path))
 
-ds = PairsDataset(Path(pairs_path), density)
+train_rows: List[PairRow] = []
+val_rows: List[PairRow] = []
+if val_ratio > 0.0:
+    train_rows, val_rows = split_pair_rows(Path(pairs_path), density, val_ratio, val_seed)
+    print0(f"Train/val split: {len(train_rows)} train | {len(val_rows)} val (ratio={val_ratio})")
+
+ds = PairsDataset(Path(pairs_path), density, rows=train_rows or None)
 print0(f"Dataset size: {len(ds)} pairs | density_aware={density_aware}")
+
+val_ds = PairsDataset(Path(pairs_path), density, rows=val_rows or None) if val_rows else None
 
 # DataLoader with DistributedSampler
 sampler = DistributedSampler(ds, shuffle=True) if ddp else None
@@ -289,6 +399,18 @@ dl = DataLoader(
     drop_last=True,
     collate_fn=lambda batch: batch,
 )
+
+val_dl = None
+if val_ds is not None:
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=lambda batch: batch,
+    )
 
 # Reward head
 print0(f"Building RewardHead with input_dim={hidden_size}...")
@@ -363,6 +485,27 @@ while step < max_steps:
                 "weight_mean": w_mean,
             })
 
+        if val_dl is not None and eval_every > 0 and (step % eval_every == 0 or step == max_steps):
+            val_loss, val_margin = evaluate_reward_model(
+                backbone,
+                head,
+                val_dl,
+                tokenizer,
+                pad_id,
+                weight_mode,
+                weight_cap,
+                autocast_ctx,
+                max_len,
+                min_prompt,
+                device,
+            )
+            wandb_run.log({
+                "step": step,
+                "val/loss": val_loss,
+                "val/reward_margin": val_margin,
+            })
+            print0(f"    [val] loss {val_loss:.4f} | reward_margin {val_margin:+.4f}")
+
 # Checkpoint
 if master_process:
     ckpt = {
@@ -379,6 +522,8 @@ if master_process:
             "backbone_block_indices": trainable_block_indices,
             "backbone_lr": backbone_lr,
             "learning_rate": learning_rate,
+            "val_ratio": val_ratio,
+            "val_seed": val_seed,
         }
     }
     out_path = Path(save_dir) / f"model_{int(time.time())}.pt"
