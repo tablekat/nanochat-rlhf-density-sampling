@@ -267,8 +267,16 @@ print0(f"Dataset size: {len(ds)} pairs | density_aware={density_aware}")
 
 # DataLoader with DistributedSampler
 sampler = DistributedSampler(ds, shuffle=True) if ddp else None
-dl = DataLoader(ds, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler,
-                num_workers=2, pin_memory=True, drop_last=True)
+dl = DataLoader(
+    ds,
+    batch_size=batch_size,
+    shuffle=(sampler is None),
+    sampler=sampler,
+    num_workers=2,
+    pin_memory=True,
+    drop_last=True,
+    collate_fn=lambda batch: batch,
+)
 
 # Reward head
 print0(f"Building RewardHead with input_dim={hidden_size}...")

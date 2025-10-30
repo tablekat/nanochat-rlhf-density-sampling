@@ -256,8 +256,16 @@ ds = Pairs(Path(pairs_path))
 pad_id = tokenizer.encode_special("<|assistant_end|>")
 
 sampler = DistributedSampler(ds, shuffle=True) if ddp else None
-dl = DataLoader(ds, batch_size=batch_size, shuffle=(sampler is None), sampler=sampler,
-                num_workers=2, pin_memory=True, drop_last=True)
+dl = DataLoader(
+    ds,
+    batch_size=batch_size,
+    shuffle=(sampler is None),
+    sampler=sampler,
+    num_workers=2,
+    pin_memory=True,
+    drop_last=True,
+    collate_fn=lambda batch: batch,
+)
 
 # Optimizer and KL controller
 opt = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
