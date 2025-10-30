@@ -49,6 +49,7 @@ device_type = ""  # cuda|cpu|mps (empty => autodetect)
 rm_source = "rm"  # rm|rm_density
 batch_size = 64
 learning_rate = 5e-4
+backbone_lr = 5e-5
 weight_decay = 0.0
 max_steps = 1000
 log_every = 25
@@ -246,11 +247,15 @@ if density_weights_path is None:
 print0(f"Loading SFT backbone...")
 backbone, tokenizer, _ = load_model(source="sft", device=device, phase="eval")
 backbone.eval()
-# Match backbone and activation dtype to avoid bf16/float mismatches on CUDA
-if device_type == "cuda":
-    backbone = backbone.to(dtype=torch.bfloat16)
 for p in backbone.parameters():
     p.requires_grad_(False)
+
+# Unfreeze the final transformer block for joint training with the RM head
+trainable_block = backbone.transformer.h[-1]
+for p in trainable_block.parameters():
+    p.requires_grad_(True)
+trainable_block.train()
+print0("Unfreezing final transformer block for reward model fine-tuning")
 
 hidden_size = getattr(getattr(backbone, "config", None), "n_embd", None)
 assert hidden_size is not None, "model.config.n_embd not found"
@@ -284,7 +289,11 @@ dl = DataLoader(
 # Reward head
 print0(f"Building RewardHead with input_dim={hidden_size}...")
 head = RewardHead(in_dim=hidden_size).to(device)
-opt = torch.optim.AdamW(head.parameters(), lr=learning_rate, weight_decay=weight_decay)
+param_groups = [
+    {"params": head.parameters(), "lr": learning_rate},
+    {"params": trainable_block.parameters(), "lr": backbone_lr},
+]
+opt = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
 # Mkdir
 if master_process:
@@ -307,13 +316,12 @@ while step < max_steps:
         x_c, y_c, x_r, y_r, w = make_batch(_rows, tokenizer, max_len, min_prompt, device, pad_id)
         
         # Forward
-        with torch.no_grad():
-            fc = extract_features(backbone, x_c, pad_id)
-            fr = extract_features(backbone, x_r, pad_id)
-            target_dtype = head.fc.weight.dtype
-            fc = fc.to(dtype=target_dtype)
-            fr = fr.to(dtype=target_dtype)
-        
+        fc = extract_features(backbone, x_c, pad_id)
+        fr = extract_features(backbone, x_r, pad_id)
+        target_dtype = head.fc.weight.dtype
+        fc = fc.to(dtype=target_dtype)
+        fr = fr.to(dtype=target_dtype)
+
         rc = head(fc)
         rr = head(fr)
         loss_vec = bt_loss(rc, rr)
