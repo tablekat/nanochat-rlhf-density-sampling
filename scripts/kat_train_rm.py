@@ -62,8 +62,8 @@ pairs_path = None  # Auto-resolved
 density_weights_path = None  # Auto-resolved
 weight_mode = "mean"  # mean|sum|none
 weight_cap = None  # clip weights to max value
-max_len = 512
-min_prompt = 128
+max_len = 512 # TODO: try 4096
+min_prompt = 128 # TODO: try 256
 
 # Tokenizer
 tokenizer_path = "tokenizer.model"
@@ -176,42 +176,58 @@ def truncate_two(p: List[int], r: List[int], max_len: int, min_prompt: int) -> T
         p = p[over:]
     return p, r
 
-def make_batch(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, device: torch.device, pad_id: int):
-    """Prepare batch tensors with per-example weights."""
-    pcs, prs, ccs, rrs = [], [], [], []
-    weights = []
-    
+def make_batch(
+    rows: List[PairRow],
+    tokenizer,
+    max_len: int,
+    min_prompt: int,
+    device: torch.device,
+    pad_id: int,
+):
+    """Prepare tensors for a minibatch of preference pairs."""
+
+    chosen_token_ids: List[List[int]] = []      # prompt + chosen completion
+    rejected_token_ids: List[List[int]] = []    # prompt + rejected completion
+    chosen_labels: List[List[int]] = []         # cross-entropy labels for chosen branch
+    rejected_labels: List[List[int]] = []       # cross-entropy labels for rejected branch
+    example_weights: List[float] = []
+
     for row in rows:
-        # NEW: Handle prefix conversation object using render_for_completion
         try:
-            p = render_prefix_for_completion(tokenizer, row.prefix)
+            prompt_ids = render_prefix_for_completion(tokenizer, row.prefix)
         except ValueError:
-            p = render_prefix_for_completion(tokenizer, None)
-        
-        c = tokenizer.encode(row.chosen)
-        r = tokenizer.encode(row.rejected)
-        
-        p1, c1 = truncate_two(p, c, max_len, min_prompt)
-        p2, r2 = truncate_two(p, r, max_len, min_prompt)
-        
-        pc, pr = p1 + c1, p2 + r2
-        lc = [-100]*len(p1) + c1
-        lr = [-100]*len(p2) + r2
-        
-        pcs.append(pc); prs.append(pr)
-        ccs.append(lc); rrs.append(lr)
-        weights.append(row.weight)
-    
-    def pad_batch(xs):
-        xs = [x[:max_len] for x in xs]
-        return torch.tensor([x + [pad_id]*(max_len - len(x)) for x in xs], dtype=torch.long, device=device)
-    
-    def pad_labels(ls):
-        ls = [l[:max_len] for l in ls]
-        return torch.tensor([l + [-100]*(max_len - len(l)) for l in ls], dtype=torch.long, device=device)
-    
-    return (pad_batch(pcs), pad_labels(ccs), pad_batch(prs), pad_labels(rrs), 
-            torch.tensor(weights, dtype=torch.float32, device=device))
+            prompt_ids = render_prefix_for_completion(tokenizer, None)
+
+        chosen_ids = tokenizer.encode(row.chosen)
+        rejected_ids = tokenizer.encode(row.rejected)
+
+        prompt_chosen_ids, chosen_trimmed = truncate_two(prompt_ids, chosen_ids, max_len, min_prompt)
+        prompt_rejected_ids, rejected_trimmed = truncate_two(prompt_ids, rejected_ids, max_len, min_prompt)
+
+        # Model inputs are prompt followed by completion tokens. Labels ignore the prompt portion.
+        chosen_token_ids.append(prompt_chosen_ids + chosen_trimmed)
+        rejected_token_ids.append(prompt_rejected_ids + rejected_trimmed)
+        chosen_labels.append([-100] * len(prompt_chosen_ids) + chosen_trimmed)
+        rejected_labels.append([-100] * len(prompt_rejected_ids) + rejected_trimmed)
+        example_weights.append(row.weight)
+
+    def pad_sequences(seqs: List[List[int]]) -> torch.Tensor:
+        seqs = [seq[:max_len] for seq in seqs]
+        padded = [seq + [pad_id] * (max_len - len(seq)) for seq in seqs]
+        return torch.tensor(padded, dtype=torch.long, device=device)
+
+    def pad_label_sequences(seqs: List[List[int]]) -> torch.Tensor:
+        seqs = [seq[:max_len] for seq in seqs]
+        padded = [seq + [-100] * (max_len - len(seq)) for seq in seqs]
+        return torch.tensor(padded, dtype=torch.long, device=device)
+
+    return (
+        pad_sequences(chosen_token_ids),
+        pad_label_sequences(chosen_labels),
+        pad_sequences(rejected_token_ids),
+        pad_label_sequences(rejected_labels),
+        torch.tensor(example_weights, dtype=torch.float32, device=device),
+    )
 
 @torch.no_grad()
 def extract_features(backbone, x: torch.Tensor, pad_id: int) -> torch.Tensor:
@@ -304,18 +320,20 @@ def evaluate_reward_model(
     head.eval()
 
     with torch.no_grad():
-        for rows in loader:
-            x_c, y_c, x_r, y_r, w = make_batch(rows, tokenizer, max_len, min_prompt, device, pad_id)
+    for rows in loader:
+        chosen_input_ids, chosen_labels, rejected_input_ids, rejected_labels, example_weights = make_batch(
+            rows, tokenizer, max_len, min_prompt, device, pad_id
+        )
             with autocast_ctx:
-                fc = extract_features(backbone, x_c, pad_id)
-                fr = extract_features(backbone, x_r, pad_id)
-                rc = head(fc)
-                rr = head(fr)
-                loss_vec = bt_loss(rc, rr)
-                loss = apply_weights(loss_vec, w, weight_mode, weight_cap)
-            margin = (rc - rr).mean()
-            losses.append(loss.float().item())
-            margins.append(margin.float().item())
+            chosen_features = extract_features(backbone, chosen_input_ids, pad_id)
+            rejected_features = extract_features(backbone, rejected_input_ids, pad_id)
+            chosen_rewards = head(chosen_features)
+            rejected_rewards = head(rejected_features)
+            reward_margins = chosen_rewards - rejected_rewards
+            loss_vec = F.softplus(-reward_margins)
+            loss = apply_weights(loss_vec, example_weights, weight_mode, weight_cap)
+        losses.append(loss.float().item())
+        margins.append(reward_margins.float().mean().item())
 
     if backbone_was_training:
         backbone.train()
@@ -446,16 +464,23 @@ while step < max_steps:
         if step > max_steps:
             break
         
-        x_c, y_c, x_r, y_r, w = make_batch(_rows, tokenizer, max_len, min_prompt, device, pad_id)
+        chosen_input_ids, chosen_labels, rejected_input_ids, rejected_labels, example_weights = make_batch(
+            _rows, tokenizer, max_len, min_prompt, device, pad_id
+        )
         
         # Forward
         with autocast_ctx:
-            fc = extract_features(backbone, x_c, pad_id)
-            fr = extract_features(backbone, x_r, pad_id)
-            rc = head(fc)
-            rr = head(fr)
-            loss_vec = bt_loss(rc, rr)
-            loss = apply_weights(loss_vec, w, weight_mode, weight_cap)
+            chosen_features = extract_features(backbone, chosen_input_ids, pad_id)
+            rejected_features = extract_features(backbone, rejected_input_ids, pad_id)
+
+            # Reward scores for each branch
+            chosen_rewards = head(chosen_features)
+            rejected_rewards = head(rejected_features)
+
+            # Bradley–Terry loss: L = E[ log(1 + exp(-(r_chosen - r_rejected))) ]
+            reward_margins = chosen_rewards - rejected_rewards
+            loss_vec = F.softplus(-reward_margins)
+            loss = apply_weights(loss_vec, example_weights, weight_mode, weight_cap)
         loss = loss.float()
         
         # Backward
@@ -470,19 +495,27 @@ while step < max_steps:
         # Logging
         if step % log_every == 0:
             with torch.no_grad():
-                margin = (rc - rr).mean().item()
-                lw_mean = loss_vec.mean().item()
-                w_mean = w.mean().item()
-            
-            print0(f"step {step:06d}/{max_steps:06d} | loss {loss.item():.4f} (ex {lw_mean:.4f}) | "
-                  f"margin {margin:+.4f} | w_mean {w_mean:.4g}")
+                margin_mean = reward_margins.mean().item()
+                loss_mean = loss_vec.mean().item()
+                weight_mean = example_weights.mean().item()
+
+            print0(
+                "step {}/{} | loss {:.4f} (per-ex {:.4f}) | margin {:+.4f} | weight_mean {:.4g}".format(
+                    step,
+                    max_steps,
+                    loss.item(),
+                    loss_mean,
+                    margin_mean,
+                    weight_mean,
+                )
+            )
             
             wandb_run.log({
                 "step": step,
                 "loss": loss.item(),
-                "loss_ex_mean": lw_mean,
-                "reward_margin": margin,
-                "weight_mean": w_mean,
+                "loss_ex_mean": loss_mean,
+                "reward_margin": margin_mean,
+                "weight_mean": weight_mean,
             })
 
         if val_dl is not None and eval_every > 0 and (step % eval_every == 0 or step == max_steps):
