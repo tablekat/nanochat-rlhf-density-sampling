@@ -250,13 +250,16 @@ backbone.train()
 for p in backbone.parameters():
     p.requires_grad_(False)
 
-# Unfreeze the final transformer block for joint training with the RM head
-trainable_block_idx = -1
-trainable_block = backbone.transformer.h[trainable_block_idx]
-for p in trainable_block.parameters():
-    p.requires_grad_(True)
-trainable_block.train()
-print0("Unfreezing final transformer block for reward model fine-tuning")
+# Unfreeze the final transformer blocks for joint training with the RM head
+trainable_block_indices = [-2, -1]
+trainable_blocks = []
+for block_idx in trainable_block_indices:
+    block = backbone.transformer.h[block_idx]
+    for p in block.parameters():
+        p.requires_grad_(True)
+    block.train()
+    trainable_blocks.append((block_idx, block))
+print0(f"Unfreezing transformer blocks {trainable_block_indices} for reward model fine-tuning")
 
 hidden_size = getattr(getattr(backbone, "config", None), "n_embd", None)
 assert hidden_size is not None, "model.config.n_embd not found"
@@ -292,8 +295,9 @@ print0(f"Building RewardHead with input_dim={hidden_size}...")
 head = RewardHead(in_dim=hidden_size).to(device)
 param_groups = [
     {"params": head.parameters(), "lr": learning_rate},
-    {"params": trainable_block.parameters(), "lr": backbone_lr},
 ]
+for _, block in trainable_blocks:
+    param_groups.append({"params": block.parameters(), "lr": backbone_lr})
 opt = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
 autocast_ctx = (
@@ -335,10 +339,10 @@ while step < max_steps:
         # Backward
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(head.parameters()) + list(trainable_block.parameters()),
-            1.0,
-        )
+        clip_params = list(head.parameters())
+        for _, block in trainable_blocks:
+            clip_params.extend(block.parameters())
+        torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
         opt.step()
         
         # Logging
@@ -363,7 +367,7 @@ while step < max_steps:
 if master_process:
     ckpt = {
         "rm_head_state_dict": head.state_dict(),
-        "backbone_block_state_dict": trainable_block.state_dict(),
+        "backbone_blocks_state_dict": {str(idx): block.state_dict() for idx, block in trainable_blocks},
         "meta": {
             "features_dim": hidden_size,  # <-- matches hidden states
             "weight_mode": weight_mode,
@@ -372,7 +376,7 @@ if master_process:
             "pad_id": int(pad_id),
             "max_len": max_len,
             "min_prompt": min_prompt,
-            "backbone_block_index": trainable_block_idx,
+            "backbone_block_indices": trainable_block_indices,
             "backbone_lr": backbone_lr,
             "learning_rate": learning_rate,
         }

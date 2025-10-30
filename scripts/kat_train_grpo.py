@@ -249,13 +249,22 @@ head.load_state_dict(rm["rm_head_state_dict"])
 for p_ in head.parameters():
     p_.requires_grad_(False)
 
-# If RM training also fine-tuned a transformer block, load it into policy/reference
-backbone_block_state = rm.get("backbone_block_state_dict")
-if backbone_block_state is not None:
-    block_idx = rm.get("meta", {}).get("backbone_block_index", -1)
-    print0(f"Applying reward-model backbone block (index {block_idx}) to policy/reference")
-    policy.transformer.h[block_idx].load_state_dict(backbone_block_state)
-    reference.transformer.h[block_idx].load_state_dict(backbone_block_state)
+# If RM training also fine-tuned transformer blocks, load them into policy/reference
+blocks_state = rm.get("backbone_blocks_state_dict")
+if blocks_state is not None:
+    indices = rm.get("meta", {}).get("backbone_block_indices")
+    if indices is None:
+        # Backwards compatibility with single-block checkpoints
+        block_idx = rm.get("meta", {}).get("backbone_block_index", -1)
+        indices = [block_idx]
+        blocks_state = {str(block_idx): rm.get("backbone_block_state_dict")}
+    print0(f"Applying reward-model backbone blocks {indices} to policy/reference")
+    for idx in indices:
+        state = blocks_state.get(str(idx))
+        if state is None:
+            continue
+        policy.transformer.h[idx].load_state_dict(state)
+        reference.transformer.h[idx].load_state_dict(state)
 
 # Dataset
 print0(f"Loading preference dataset...")

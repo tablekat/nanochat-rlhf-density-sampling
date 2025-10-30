@@ -237,7 +237,7 @@ def find_latest_checkpoint(directory: Path) -> Path:
 def load_reward_heads(
     sources: List[str],
     device: torch.device,
-) -> List[Tuple[str, RewardHead, Dict[str, torch.Tensor], Path, int, Optional[Dict[str, torch.Tensor]]]]:
+) -> List[Tuple[str, RewardHead, Dict[str, torch.Tensor], Path, List[int], Dict[str, torch.Tensor]]]:
     base = Path(get_base_dir())
     mapping = {
         "rm": base / "rm_checkpoints" / "uniform" / "d20",
@@ -255,9 +255,17 @@ def load_reward_heads(
         head = RewardHead(feat_dim).to(device)
         head.load_state_dict(ckpt["rm_head_state_dict"])
         head.eval()
-        block_state = ckpt.get("backbone_block_state_dict")
-        block_idx = meta.get("backbone_block_index", -1)
-        heads.append((source, head, meta, Path(ckpt_path), block_idx, block_state))
+        blocks_state = ckpt.get("backbone_blocks_state_dict")
+        if blocks_state is None:
+            # Backwards compatibility with single-block checkpoints
+            single_state = ckpt.get("backbone_block_state_dict")
+            block_idx = meta.get("backbone_block_index", -1)
+            if single_state is not None:
+                blocks_state = {str(block_idx): single_state}
+            block_indices = [block_idx]
+        else:
+            block_indices = meta.get("backbone_block_indices", [int(k) for k in blocks_state.keys()])
+        heads.append((source, head, meta, Path(ckpt_path), block_indices, blocks_state or {}))
     return heads
 
 
@@ -300,14 +308,18 @@ def evaluate(args):
     min_prompt = args.min_prompt
 
     summaries = {}
-    for name, head, meta, ckpt_path, block_idx, block_state in heads:
+    for name, head, meta, ckpt_path, block_indices, blocks_state in heads:
         print(f"Evaluating reward model '{name}' from {ckpt_path}")
         backbone, tokenizer, _ = load_model("sft", device=device, phase="eval")
         backbone.eval()
         for param in backbone.parameters():
             param.requires_grad_(False)
-        if block_state is not None:
-            backbone.transformer.h[block_idx].load_state_dict(block_state)
+        if blocks_state:
+            for idx in block_indices:
+                state = blocks_state.get(str(idx))
+                if state is None:
+                    continue
+                backbone.transformer.h[idx].load_state_dict(state)
         pad_id = tokenizer.encode_special("<|assistant_end|>")
 
         metric = Metrics(name)
