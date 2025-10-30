@@ -246,7 +246,8 @@ if density_weights_path is None:
 # Load backbone
 print0(f"Loading SFT backbone...")
 backbone, tokenizer, _ = load_model(source="sft", device=device, phase="eval")
-backbone.eval()
+backbone = backbone.to(dtype=torch.float32)
+backbone.train()
 for p in backbone.parameters():
     p.requires_grad_(False)
 
