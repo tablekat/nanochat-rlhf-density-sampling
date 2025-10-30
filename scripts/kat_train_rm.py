@@ -188,8 +188,6 @@ def make_batch(
 
     chosen_token_ids: List[List[int]] = []      # prompt + chosen completion
     rejected_token_ids: List[List[int]] = []    # prompt + rejected completion
-    chosen_labels: List[List[int]] = []         # cross-entropy labels for chosen branch
-    rejected_labels: List[List[int]] = []       # cross-entropy labels for rejected branch
     example_weights: List[float] = []
 
     for row in rows:
@@ -207,8 +205,6 @@ def make_batch(
         # Model inputs are prompt followed by completion tokens. Labels ignore the prompt portion.
         chosen_token_ids.append(prompt_chosen_ids + chosen_trimmed)
         rejected_token_ids.append(prompt_rejected_ids + rejected_trimmed)
-        chosen_labels.append([-100] * len(prompt_chosen_ids) + chosen_trimmed)
-        rejected_labels.append([-100] * len(prompt_rejected_ids) + rejected_trimmed)
         example_weights.append(row.weight)
 
     def pad_sequences(seqs: List[List[int]]) -> torch.Tensor:
@@ -216,16 +212,9 @@ def make_batch(
         padded = [seq + [pad_id] * (max_len - len(seq)) for seq in seqs]
         return torch.tensor(padded, dtype=torch.long, device=device)
 
-    def pad_label_sequences(seqs: List[List[int]]) -> torch.Tensor:
-        seqs = [seq[:max_len] for seq in seqs]
-        padded = [seq + [-100] * (max_len - len(seq)) for seq in seqs]
-        return torch.tensor(padded, dtype=torch.long, device=device)
-
     return (
         pad_sequences(chosen_token_ids),
-        pad_label_sequences(chosen_labels),
         pad_sequences(rejected_token_ids),
-        pad_label_sequences(rejected_labels),
         torch.tensor(example_weights, dtype=torch.float32, device=device),
     )
 
@@ -321,7 +310,7 @@ def evaluate_reward_model(
 
     with torch.no_grad():
     for rows in loader:
-        chosen_input_ids, chosen_labels, rejected_input_ids, rejected_labels, example_weights = make_batch(
+        chosen_input_ids, rejected_input_ids, example_weights = make_batch(
             rows, tokenizer, max_len, min_prompt, device, pad_id
         )
             with autocast_ctx:
@@ -464,7 +453,7 @@ while step < max_steps:
         if step > max_steps:
             break
         
-        chosen_input_ids, chosen_labels, rejected_input_ids, rejected_labels, example_weights = make_batch(
+        chosen_input_ids, rejected_input_ids, example_weights = make_batch(
             _rows, tokenizer, max_len, min_prompt, device, pad_id
         )
         
