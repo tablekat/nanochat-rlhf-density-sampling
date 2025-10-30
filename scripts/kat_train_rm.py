@@ -251,7 +251,8 @@ for p in backbone.parameters():
     p.requires_grad_(False)
 
 # Unfreeze the final transformer block for joint training with the RM head
-trainable_block = backbone.transformer.h[-1]
+trainable_block_idx = -1
+trainable_block = backbone.transformer.h[trainable_block_idx]
 for p in trainable_block.parameters():
     p.requires_grad_(True)
 trainable_block.train()
@@ -330,7 +331,10 @@ while step < max_steps:
         # Backward
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(
+            list(head.parameters()) + list(trainable_block.parameters()),
+            1.0,
+        )
         opt.step()
         
         # Logging
@@ -355,6 +359,7 @@ while step < max_steps:
 if master_process:
     ckpt = {
         "rm_head_state_dict": head.state_dict(),
+        "backbone_block_state_dict": trainable_block.state_dict(),
         "meta": {
             "features_dim": hidden_size,  # <-- matches hidden states
             "weight_mode": weight_mode,
@@ -363,6 +368,9 @@ if master_process:
             "pad_id": int(pad_id),
             "max_len": max_len,
             "min_prompt": min_prompt,
+            "backbone_block_index": trainable_block_idx,
+            "backbone_lr": backbone_lr,
+            "learning_rate": learning_rate,
         }
     }
     out_path = Path(save_dir) / f"model_{int(time.time())}.pt"

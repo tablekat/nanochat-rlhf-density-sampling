@@ -234,7 +234,10 @@ def find_latest_checkpoint(directory: Path) -> Path:
     return max(ckpts, key=lambda p: int(Path(p).stem.split("_")[1]))
 
 
-def load_reward_heads(sources: List[str], device: torch.device) -> List[Tuple[str, RewardHead, Dict[str, torch.Tensor], Path]]:
+def load_reward_heads(
+    sources: List[str],
+    device: torch.device,
+) -> List[Tuple[str, RewardHead, Dict[str, torch.Tensor], Path, int, Optional[Dict[str, torch.Tensor]]]]:
     base = Path(get_base_dir())
     mapping = {
         "rm": base / "rm_checkpoints" / "uniform" / "d20",
@@ -252,7 +255,9 @@ def load_reward_heads(sources: List[str], device: torch.device) -> List[Tuple[st
         head = RewardHead(feat_dim).to(device)
         head.load_state_dict(ckpt["rm_head_state_dict"])
         head.eval()
-        heads.append((source, head, meta, Path(ckpt_path)))
+        block_state = ckpt.get("backbone_block_state_dict")
+        block_idx = meta.get("backbone_block_index", -1)
+        heads.append((source, head, meta, Path(ckpt_path), block_idx, block_state))
     return heads
 
 
@@ -288,63 +293,69 @@ def evaluate(args):
 
     print(f"Loaded {len(rows)} evaluation pairs")
 
-    # Load backbone & tokenizer
-    backbone, tokenizer, _ = load_model("sft", device=device, phase="eval")
-    backbone.eval()
-    for param in backbone.parameters():
-        param.requires_grad_(False)
-    pad_id = tokenizer.encode_special("<|assistant_end|>")
-
     heads = load_reward_heads(args.rm_sources.split(","), device)
-    metrics = {name: Metrics(name) for name, *_ in heads}
 
     batch_size = args.batch_size
     max_len = args.max_len
     min_prompt = args.min_prompt
 
-    for start in tqdm(range(0, len(rows), batch_size), desc="Evaluating"):
-        batch = rows[start:start + batch_size]
-        pcs, prs = [], []
-        sources, weights, bins = [], [], []
+    summaries = {}
+    for name, head, meta, ckpt_path, block_idx, block_state in heads:
+        print(f"Evaluating reward model '{name}' from {ckpt_path}")
+        backbone, tokenizer, _ = load_model("sft", device=device, phase="eval")
+        backbone.eval()
+        for param in backbone.parameters():
+            param.requires_grad_(False)
+        if block_state is not None:
+            backbone.transformer.h[block_idx].load_state_dict(block_state)
+        pad_id = tokenizer.encode_special("<|assistant_end|>")
 
-        for row in batch:
-            try:
-                prompt_tokens = render_prefix_for_completion(tokenizer, row.prefix)
-            except ValueError:
-                prompt_tokens = render_prefix_for_completion(tokenizer, None)
-            chosen_ids = tokenizer.encode(row.chosen)
-            rejected_ids = tokenizer.encode(row.rejected)
-            p1, c1 = truncate_two(prompt_tokens, chosen_ids, max_len, min_prompt)
-            p2, r2 = truncate_two(prompt_tokens, rejected_ids, max_len, min_prompt)
-            pcs.append(p1 + c1)
-            prs.append(p2 + r2)
-            sources.append(row.src)
-            weights.append(row.weight)
-            bins.append(row.weight_bin)
+        metric = Metrics(name)
 
-        def pad_sequences(seq_list: List[List[int]]) -> torch.Tensor:
-            seq_list = [seq[:max_len] for seq in seq_list]
-            max_seq = max(len(seq) for seq in seq_list)
-            padded = [seq + [pad_id] * (max_seq - len(seq)) for seq in seq_list]
-            return torch.tensor(padded, dtype=torch.long, device=device)
+        for start in tqdm(range(0, len(rows), batch_size), desc=f"{name} eval"):
+            batch = rows[start:start + batch_size]
+            pcs, prs = [], []
+            sources, weights, bins = [], [], []
 
-        x_c = pad_sequences(pcs)
-        x_r = pad_sequences(prs)
+            for row in batch:
+                try:
+                    prompt_tokens = render_prefix_for_completion(tokenizer, row.prefix)
+                except ValueError:
+                    prompt_tokens = render_prefix_for_completion(tokenizer, None)
+                chosen_ids = tokenizer.encode(row.chosen)
+                rejected_ids = tokenizer.encode(row.rejected)
+                p1, c1 = truncate_two(prompt_tokens, chosen_ids, max_len, min_prompt)
+                p2, r2 = truncate_two(prompt_tokens, rejected_ids, max_len, min_prompt)
+                pcs.append(p1 + c1)
+                prs.append(p2 + r2)
+                sources.append(row.src)
+                weights.append(row.weight)
+                bins.append(row.weight_bin)
 
-        with torch.no_grad():
-            feat_c = extract_features(backbone, x_c, pad_id)
-            feat_r = extract_features(backbone, x_r, pad_id)
+            if not pcs:
+                continue
 
-        for name, head, meta, ckpt_path in heads:
+            def pad_sequences(seq_list: List[List[int]]) -> torch.Tensor:
+                seq_list = [seq[:max_len] for seq in seq_list]
+                max_seq = max(len(seq) for seq in seq_list)
+                padded = [seq + [pad_id] * (max_seq - len(seq)) for seq in seq_list]
+                return torch.tensor(padded, dtype=torch.long, device=device)
+
+            x_c = pad_sequences(pcs)
+            x_r = pad_sequences(prs)
+
             with torch.no_grad():
+                feat_c = extract_features(backbone, x_c, pad_id)
+                feat_r = extract_features(backbone, x_r, pad_id)
                 rc = head(feat_c)
                 rr = head(feat_r)
                 margin = (rc - rr).detach().cpu().numpy()
+
             correct = margin > 0
             for src, bin_label, ok, m, w in zip(sources, bins, correct, margin, weights):
-                metrics[name].add(src, bin_label, bool(ok), float(m), float(w))
+                metric.add(src, bin_label, bool(ok), float(m), float(w))
 
-    summaries = {name: metric.summarize() for name, metric in metrics.items()}
+        summaries[name] = metric.summarize()
 
     if args.output_json:
         os.makedirs(Path(args.output_json).parent, exist_ok=True)
