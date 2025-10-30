@@ -161,6 +161,7 @@ echo ""
 # Output: $NANOCHAT_BASE_DIR/rm_checkpoints/uniform/d20/model_*.pt
 echo "  Training RM #1: Regular (uniform sampling)..."
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
+    -- \
     --rm_source=rm \
     --max_steps=1000 \
     --run=${WANDB_RUN}_rm_uniform
@@ -222,6 +223,7 @@ echo "  Policy learns from RM trained with uniform sampling"
 echo "  Policy training also uses uniform sampling"
 echo "================================================================"
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo \
+    -- \
     --rm_source rm \
     --grpo_source grpo \
     --max_steps=5000 \

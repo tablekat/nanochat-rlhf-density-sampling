@@ -246,6 +246,9 @@ if density_weights_path is None:
 print0(f"Loading SFT backbone...")
 backbone, tokenizer, _ = load_model(source="sft", device=device, phase="eval")
 backbone.eval()
+# Match backbone and activation dtype to avoid bf16/float mismatches on CUDA
+if device_type == "cuda":
+    backbone = backbone.to(dtype=torch.bfloat16)
 for p in backbone.parameters():
     p.requires_grad_(False)
 
@@ -307,6 +310,9 @@ while step < max_steps:
         with torch.no_grad():
             fc = extract_features(backbone, x_c, pad_id)
             fr = extract_features(backbone, x_r, pad_id)
+            target_dtype = head.fc.weight.dtype
+            fc = fc.to(dtype=target_dtype)
+            fr = fr.to(dtype=target_dtype)
         
         rc = head(fc)
         rr = head(fr)
