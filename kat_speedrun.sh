@@ -168,6 +168,15 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm \
 echo "  ✓ RM #1 (uniform) trained"
 echo ""
 
+echo "  Training RM #2: Dual Likert scorer (uniform sampling)..."
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm_dual \
+    -- \
+    --rm_source=rm \
+    --max_steps=1000 \
+    --run=${WANDB_RUN}_rm_dual
+echo "  ✓ RM #2 (dual) trained"
+echo ""
+
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rm
 
 echo "✓ Reward Models training complete"
