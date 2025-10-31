@@ -59,7 +59,7 @@ backbone_lr = 5e-6
 weight_decay = 0.0
 max_steps = 1000
 log_every = 25
-eval_every = 100
+eval_every = 25
 val_ratio = 0.05
 val_seed = 123
 
