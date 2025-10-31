@@ -572,8 +572,8 @@ while step < max_steps:
                 response_a_suffix_ids,
                 response_b_prefix_ids,
                 response_b_suffix_ids,
+                rejected_token_id, # swappeD!!!!!!!!
                 preferred_token_id,
-                rejected_token_id,
             )
             wandb_run.log({
                 "step": step,

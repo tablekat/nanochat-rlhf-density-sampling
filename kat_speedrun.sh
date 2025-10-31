@@ -177,7 +177,7 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_rm_d
 echo "  ✓ RM #2 (dual) trained"
 echo ""
 
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rm
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i rm
 
 echo "✓ Reward Models training complete"
 echo ""
