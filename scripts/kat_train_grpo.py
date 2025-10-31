@@ -52,7 +52,8 @@ grad_clip = 0.5
 beta = 0.02  # initial KL weight
 target_kl = 0.05  # target per-sample KL
 beta_gain = 0.02  # KL controller update speed
-std_adv = False  # standardize advantage
+std_adv = True   # standardize advantage
+margin_scale = 0.1  # rescales RM margin before GRPO
 max_steps = 5000
 log_every = 25
 eval_every = -1  # -1 = disable
@@ -490,7 +491,7 @@ while step < max_steps:
         rr = torch.where(first_is_preferred, logprob_second, logprob_first)
         
         # Advantage and loss
-        dr = rc - rr
+        dr = (rc - rr) # * margin_scale
         dkl = kl_c - kl_r
         A = dr - kl_beta * dkl
         if std_adv:
