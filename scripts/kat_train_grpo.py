@@ -149,7 +149,17 @@ def build_dual_sequences(
     rejected_token_id: int,
 ):
     rating_prompt_len = len(rating_prompt_ids)
-    effective_max_len = max(1, max_len - rating_prompt_len - 2)
+    fixed_overhead = (
+        len(response_a_prefix_ids)
+        + len(response_a_suffix_ids)
+        + len(response_b_prefix_ids)
+        + len(response_b_suffix_ids)
+        + rating_prompt_len
+        + 2
+    )
+
+    if fixed_overhead >= max_len:
+        raise ValueError("max_len too small for dual sequence in GRPO")
 
     sequences = []
     digit1_indices = []
@@ -166,19 +176,45 @@ def build_dual_sequences(
         chosen_ids = tokenizer.encode(row.chosen)
         rejected_ids = tokenizer.encode(row.rejected)
 
-        prompt_chosen, chosen_trimmed = truncate_two(prefix_ids, chosen_ids, effective_max_len, min_prompt)
-        prompt_rejected, rejected_trimmed = truncate_two(prefix_ids, rejected_ids, effective_max_len, min_prompt)
+        min_completion_tokens = 2
+        prefix_budget = max_len - fixed_overhead - min_completion_tokens
+        if prefix_budget < 0:
+            prefix_budget = 0
 
-        chosen_seq = prompt_chosen + chosen_trimmed
-        rejected_seq = prompt_rejected + rejected_trimmed
+        if len(prefix_ids) > prefix_budget:
+            prefix_ids = prefix_ids[-prefix_budget:]
+
+        remaining = max_len - (len(prefix_ids) + fixed_overhead)
+        if remaining < min_completion_tokens:
+            remaining = min_completion_tokens
+
+        len_chosen = max(1, len(chosen_ids))
+        len_rejected = max(1, len(rejected_ids))
+        total_len = len_chosen + len_rejected
+        budget_chosen = min(len(chosen_ids), max(1, remaining * len_chosen // total_len))
+        budget_rejected = remaining - budget_chosen
+        if budget_rejected < 1:
+            budget_rejected = 1
+            if budget_chosen > 1:
+                budget_chosen -= 1
+        if budget_chosen < 1:
+            budget_chosen = 1
+        if budget_chosen + budget_rejected > remaining:
+            budget_rejected = remaining - budget_chosen
+            if budget_rejected < 1:
+                budget_rejected = 1
+                budget_chosen = max(1, remaining - budget_rejected)
+
+        chosen_trimmed = chosen_ids[:budget_chosen]
+        rejected_trimmed = rejected_ids[:budget_rejected]
 
         assembled = (
             prefix_ids
             + response_a_prefix_ids
-            + chosen_seq
+            + chosen_trimmed
             + response_a_suffix_ids
             + response_b_prefix_ids
-            + rejected_seq
+            + rejected_trimmed
             + response_b_suffix_ids
             + rating_prompt_ids
         )
@@ -194,8 +230,7 @@ def build_dual_sequences(
         digit1_tokens.append(preferred_token_id)
         digit2_tokens.append(rejected_token_id)
 
-    padded = pad_sequences(sequences, max_len, pad_id, device)
-    return padded, digit1_indices, digit2_indices, digit1_tokens, digit2_tokens
+    return pad_sequences(sequences, max_len, pad_id, device), digit1_indices, digit2_indices, digit1_tokens, digit2_tokens
 
 def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, device):
     """Collate preference pairs into batch tensors."""

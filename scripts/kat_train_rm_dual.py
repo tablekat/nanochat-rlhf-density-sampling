@@ -196,7 +196,17 @@ def build_dual_sequences(
 ) -> Tuple[torch.Tensor, List[int], List[int], List[int], List[int], List[float]]:
     random.seed(shuffle_seed)
     rating_prompt_len = len(rating_prompt_ids)
-    effective_max_len = max(1, max_len - rating_prompt_len - 2)
+    fixed_overhead = (
+        len(response_a_prefix_ids)
+        + len(response_a_suffix_ids)
+        + len(response_b_prefix_ids)
+        + len(response_b_suffix_ids)
+        + rating_prompt_len
+        + 2  # digits
+    )
+
+    if fixed_overhead >= max_len:
+        raise ValueError("max_len too small for dual-response format")
 
     sequences: List[List[int]] = []
     digit1_indices: List[int] = []
@@ -214,20 +224,48 @@ def build_dual_sequences(
         chosen_ids = tokenizer.encode(row.chosen)
         rejected_ids = tokenizer.encode(row.rejected)
 
-        prompt_chosen, chosen_trimmed = truncate_two(prefix_ids, chosen_ids, effective_max_len, min_prompt)
-        prompt_rejected, rejected_trimmed = truncate_two(prefix_ids, rejected_ids, effective_max_len, min_prompt)
+        # Determine available prefix budget (reserve at least one token per completion)
+        min_completion_tokens = 2
+        prefix_budget = max_len - fixed_overhead - min_completion_tokens
+        if prefix_budget < 0:
+            prefix_budget = 0
 
-        chosen_seq = prompt_chosen + chosen_trimmed
-        rejected_seq = prompt_rejected + rejected_trimmed
+        if len(prefix_ids) > prefix_budget:
+            prefix_ids = prefix_ids[-prefix_budget:]
+
+        remaining = max_len - (len(prefix_ids) + fixed_overhead)
+        if remaining < min_completion_tokens:
+            remaining = min_completion_tokens
+
+        # Allocate completion budgets proportional to their lengths
+        len_chosen = max(1, len(chosen_ids))
+        len_rejected = max(1, len(rejected_ids))
+        total_len = len_chosen + len_rejected
+        budget_chosen = min(len(chosen_ids), max(1, remaining * len_chosen // total_len))
+        budget_rejected = remaining - budget_chosen
+        if budget_rejected < 1:
+            budget_rejected = 1
+            if budget_chosen > 1:
+                budget_chosen -= 1
+        if budget_chosen < 1:
+            budget_chosen = 1
+        if budget_chosen + budget_rejected > remaining:
+            budget_rejected = remaining - budget_chosen
+            if budget_rejected < 1:
+                budget_rejected = 1
+                budget_chosen = max(1, remaining - budget_rejected)
+
+        chosen_trimmed = chosen_ids[:budget_chosen]
+        rejected_trimmed = rejected_ids[:budget_rejected]
 
         if random.random() < 0.5:
-            first_response = chosen_seq
-            second_response = rejected_seq
+            first_response = chosen_trimmed
+            second_response = rejected_trimmed
             first_digit = preferred_token_id
             second_digit = rejected_token_id
         else:
-            first_response = rejected_seq
-            second_response = chosen_seq
+            first_response = rejected_trimmed
+            second_response = chosen_trimmed
             first_digit = rejected_token_id
             second_digit = preferred_token_id
 
