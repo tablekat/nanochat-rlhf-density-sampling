@@ -418,7 +418,10 @@ def evaluate(args):
                 state = blocks_state.get(str(idx))
                 if state is None:
                     continue
-                backbone.transformer.h[idx].load_state_dict(state)
+                target_block = backbone.transformer.h[idx]
+                target_dtype = next(target_block.parameters()).dtype
+                cast_state = {k: v.to(target_dtype) for k, v in state.items()}
+                target_block.load_state_dict(cast_state)
         pad_id = tokenizer.encode_special("<|assistant_end|>")
 
         rating_prompt = meta.get("rating_prompt", "\nRating (Response A first, Response B second):")

@@ -233,8 +233,8 @@ echo "  Policy training also uses uniform sampling"
 echo "================================================================"
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo \
     -- \
-    --rm_source rm \
-    --grpo_source grpo \
+    --rm_source=rm \
+    --grpo_source=grpo \
     --max_steps=5000 \
     --learning_rate=1e-5 \
     --beta=0.1 \

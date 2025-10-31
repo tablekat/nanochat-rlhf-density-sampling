@@ -18,6 +18,7 @@ Design notes:
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json, time, math, hashlib
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import glob
@@ -273,7 +274,8 @@ def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, devic
 
 def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum log-probs over response tokens (teacher forcing)."""
-    logits = model(x)
+    with policy_autocast:
+        logits = model(x)
     logp = logits.log_softmax(dim=-1)
     tgt = labels[:, 1:].contiguous()
     logp = logp[:, :-1].contiguous()
@@ -283,9 +285,10 @@ def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 def sum_kl(policy, reference, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """True KL(policy || reference) over response tokens (sum over vocab)."""
-    with torch.no_grad():
-        ref_logits = reference(x)
-    pol_logits = policy(x)
+    with policy_autocast:
+        with torch.no_grad():
+            ref_logits = reference(x)
+        pol_logits = policy(x)
     logp = F.log_softmax(pol_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
     logq = F.log_softmax(ref_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
     p = logp.exp()
@@ -322,6 +325,12 @@ reference.eval()
 for p in reference.parameters():
     p.requires_grad_(False)
 
+policy_autocast = (
+    torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+    if device_type == "cuda"
+    else nullcontext()
+)
+
 # RM head
 print0(f"Loading reward model from {rm_ckpt_dir}...")
 rm_ckpt_files = glob.glob(os.path.join(rm_ckpt_dir, "model_*.pt"))
@@ -350,8 +359,15 @@ if blocks_state is not None:
         state = blocks_state.get(str(idx))
         if state is None:
             continue
-        policy.transformer.h[idx].load_state_dict(state)
-        reference.transformer.h[idx].load_state_dict(state)
+
+        def _cast_state(block, state_dict):
+            target_dtype = next(block.parameters()).dtype
+            return {k: v.to(target_dtype) for k, v in state_dict.items()}
+
+        policy_state = _cast_state(policy.transformer.h[idx], state)
+        reference_state = _cast_state(reference.transformer.h[idx], state)
+        policy.transformer.h[idx].load_state_dict(policy_state)
+        reference.transformer.h[idx].load_state_dict(reference_state)
 
 meta = rm.get("meta", {})
 rating_prompt = meta.get("rating_prompt", "\nRating (Response A first, Response B second):")
@@ -437,7 +453,8 @@ while step < max_steps:
         
         # Rewards (frozen backbone + RM logits)
         with torch.no_grad():
-            logits = reference(rm_inputs)
+            with policy_autocast:
+                logits = reference(rm_inputs)
 
         batch_sz = rm_inputs.size(0)
         batch_idx = torch.arange(batch_sz, device=device)
