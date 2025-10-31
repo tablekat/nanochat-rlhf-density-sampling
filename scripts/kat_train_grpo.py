@@ -484,10 +484,10 @@ while step < max_steps:
         rej_id  = torch.tensor([rejected_token_id],  device=device)
 
         # Gather four log-probs (two tokens at each slot)
-        lp_pref1 = logp1.gather(1, pref_id.expand(B,1)).squeeze(1)   # log p(pref | slot1)
-        lp_rej1  = logp1.gather(1, rej_id .expand(B,1)).squeeze(1)   # log p(rej  | slot1)
-        lp_pref2 = logp2.gather(1, pref_id.expand(B,1)).squeeze(1)   # log p(pref | slot2)
-        lp_rej2  = logp2.gather(1, rej_id .expand(B,1)).squeeze(1)   # log p(rej  | slot2)
+        lp_pref1 = logp1.gather(1, pref_id.expand(batch_sz,1)).squeeze(1)   # log p(pref | slot1)
+        lp_rej1  = logp1.gather(1, rej_id .expand(batch_sz,1)).squeeze(1)   # log p(rej  | slot1)
+        lp_pref2 = logp2.gather(1, pref_id.expand(batch_sz,1)).squeeze(1)   # log p(pref | slot2)
+        lp_rej2  = logp2.gather(1, rej_id .expand(batch_sz,1)).squeeze(1)   # log p(rej  | slot2)
 
         # Symmetric pairwise margin
         margin = (lp_pref1 + lp_rej2) - (lp_rej1 + lp_pref2)
