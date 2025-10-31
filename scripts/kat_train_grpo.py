@@ -149,7 +149,7 @@ def build_dual_sequences(
     rejected_token_id: int,
 ):
     rating_prompt_len = len(rating_prompt_ids)
-    effective_max_len = max(1, max_len - rating_prompt_len)
+    effective_max_len = max(1, max_len - rating_prompt_len - 2)
 
     sequences = []
     digit1_indices = []

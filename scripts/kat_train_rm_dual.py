@@ -196,7 +196,7 @@ def build_dual_sequences(
 ) -> Tuple[torch.Tensor, List[int], List[int], List[int], List[int], List[float]]:
     random.seed(shuffle_seed)
     rating_prompt_len = len(rating_prompt_ids)
-    effective_max_len = max(1, max_len - rating_prompt_len)
+    effective_max_len = max(1, max_len - rating_prompt_len - 2)
 
     sequences: List[List[int]] = []
     digit1_indices: List[int] = []
