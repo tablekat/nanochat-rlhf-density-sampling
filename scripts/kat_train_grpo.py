@@ -48,7 +48,7 @@ grpo_source = "grpo"  # grpo|grpo_density
 batch_size = 16
 learning_rate = 5e-6
 weight_decay = 0.0
-grad_clip = 1.0
+grad_clip = 0.5
 beta = 0.02  # initial KL weight
 target_kl = 0.05  # target per-sample KL
 beta_gain = 0.02  # KL controller update speed
@@ -162,7 +162,8 @@ def build_dual_sequences(
         + len(response_b_prefix_ids)
         + len(response_b_suffix_ids)
         + rating_prompt_len
-    )  # digits appended later
+        + 2  # reserve space for digits once
+    )
 
     if fixed_overhead >= max_len:
         raise ValueError("max_len too small for dual sequence in GRPO")
@@ -230,7 +231,7 @@ def build_dual_sequences(
         digit2_idx = len(assembled)
         assembled.append(rejected_token_id)
         if len(assembled) > max_len:
-            raise RuntimeError("dual sequence exceeded max_len; adjust budgets")
+            raise RuntimeError("assembled dual sequence exceeded max_len; adjust budget logic")
 
         sequences.append(assembled)
         digit1_indices.append(digit1_idx)
@@ -292,9 +293,12 @@ def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 def sum_kl(policy, reference, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """KL(policy || reference) over response tokens, length-normalized."""
-    with torch.no_grad():
-        ref_logits = reference(x).float()
-    pol_logits = policy(x).float()
+    with autocast_if_cuda():
+        with torch.no_grad():
+            ref_logits = reference(x)
+        pol_logits = policy(x)
+    ref_logits = ref_logits.float()
+    pol_logits = pol_logits.float()
     logp = F.log_softmax(pol_logits[:, :-1, :], dim=-1)
     logq = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
     p = logp.exp()
@@ -470,8 +474,8 @@ while step < max_steps:
 
         logits_digit1 = logits[batch_idx, digit1_idx_tensor - 1, :]
         logits_digit2 = logits[batch_idx, digit2_idx_tensor - 1, :]
-        reward_first = logits_digit1.gather(1, digit1_tokens_tensor.unsqueeze(1)).squeeze(1)
-        reward_second = logits_digit2.gather(1, digit2_tokens_tensor.unsqueeze(1)).squeeze(1)
+        reward_first = logits_digit1.float().gather(1, digit1_tokens_tensor.unsqueeze(1)).squeeze(1)
+        reward_second = logits_digit2.float().gather(1, digit2_tokens_tensor.unsqueeze(1)).squeeze(1)
         reward_first = reward_first.clamp(min=-20, max=20)
         reward_second = reward_second.clamp(min=-20, max=20)
 
