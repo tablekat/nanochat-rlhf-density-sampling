@@ -479,9 +479,15 @@ while step < max_steps:
         reward_first = reward_first.clamp(min=-20, max=20)
         reward_second = reward_second.clamp(min=-20, max=20)
 
+        # Convert to log-probabilities over the two digits (log-softmax for stability)
+        digit_logits = torch.stack([reward_first, reward_second], dim=1)
+        digit_log_probs = torch.log_softmax(digit_logits, dim=1)
+        logprob_first = digit_log_probs[:, 0]
+        logprob_second = digit_log_probs[:, 1]
+
         first_is_preferred = digit1_tokens_tensor == preferred_token_id
-        rc = torch.where(first_is_preferred, reward_first, reward_second)
-        rr = torch.where(first_is_preferred, reward_second, reward_first)
+        rc = torch.where(first_is_preferred, logprob_first, logprob_second)
+        rr = torch.where(first_is_preferred, logprob_second, logprob_first)
         
         # Advantage and loss
         dr = (rc - rr)
