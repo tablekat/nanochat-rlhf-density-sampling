@@ -59,7 +59,7 @@ backbone_lr = 5e-6
 weight_decay = 0.0
 max_steps = 1000
 log_every = 25
-eval_every = 25
+eval_every = 100
 val_ratio = 0.05
 val_seed = 123
 
@@ -572,8 +572,8 @@ while step < max_steps:
                 response_a_suffix_ids,
                 response_b_prefix_ids,
                 response_b_suffix_ids,
-                rejected_token_id, # swappeD!!!!!!!!
                 preferred_token_id,
+                rejected_token_id,
             )
             wandb_run.log({
                 "step": step,
