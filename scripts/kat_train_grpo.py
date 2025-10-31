@@ -46,12 +46,12 @@ device_type = ""  # cuda|cpu|mps (empty => autodetect)
 rm_source = "rm"  # rm|rm_density
 grpo_source = "grpo"  # grpo|grpo_density
 batch_size = 16
-learning_rate = 1e-5
+learning_rate = 5e-6
 weight_decay = 0.0
 grad_clip = 1.0
-beta = 0.01  # initial KL weight
-target_kl = 6.0  # target per-sample KL
-beta_gain = 0.05  # KL controller update speed
+beta = 0.02  # initial KL weight
+target_kl = 0.05  # target per-sample KL
+beta_gain = 0.02  # KL controller update speed
 std_adv = False  # standardize advantage
 max_steps = 5000
 log_every = 25
@@ -162,8 +162,7 @@ def build_dual_sequences(
         + len(response_b_prefix_ids)
         + len(response_b_suffix_ids)
         + rating_prompt_len
-        + 2
-    )
+    )  # digits appended later
 
     if fixed_overhead >= max_len:
         raise ValueError("max_len too small for dual sequence in GRPO")
@@ -230,6 +229,8 @@ def build_dual_sequences(
         assembled.append(preferred_token_id)
         digit2_idx = len(assembled)
         assembled.append(rejected_token_id)
+        if len(assembled) > max_len:
+            raise RuntimeError("dual sequence exceeded max_len; adjust budgets")
 
         sequences.append(assembled)
         digit1_indices.append(digit1_idx)
@@ -282,7 +283,7 @@ def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum log-probs over response tokens (teacher forcing)."""
     with autocast_if_cuda():
         logits = model(x)
-    logp = logits.log_softmax(dim=-1)
+    logp = logits.float().log_softmax(dim=-1)
     tgt = labels[:, 1:].contiguous()
     logp = logp[:, :-1].contiguous()
     mask = (tgt != -100)
@@ -290,17 +291,18 @@ def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return (gathered * mask).sum(dim=1)
 
 def sum_kl(policy, reference, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """True KL(policy || reference) over response tokens (sum over vocab)."""
-    with autocast_if_cuda():
-        with torch.no_grad():
-            ref_logits = reference(x)
-        pol_logits = policy(x)
-    logp = F.log_softmax(pol_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
-    logq = F.log_softmax(ref_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
+    """KL(policy || reference) over response tokens, length-normalized."""
+    with torch.no_grad():
+        ref_logits = reference(x).float()
+    pol_logits = policy(x).float()
+    logp = F.log_softmax(pol_logits[:, :-1, :], dim=-1)
+    logq = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
     p = logp.exp()
-    kl_tok = (p * (logp - logq)).sum(dim=-1)             # [B,T-1]
-    resp_mask = (labels[:, 1:] != -100).float()          # [B,T-1]
-    return (kl_tok * resp_mask).sum(dim=1)               # [B]
+    kl_tok = (p * (logp - logq)).sum(dim=-1)
+    resp_mask = (labels[:, 1:] != -100).float()
+    kl_sum = (kl_tok * resp_mask).sum(dim=1)
+    resp_len = resp_mask.sum(dim=1).clamp_min(1.0)
+    return kl_sum / resp_len
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Training
@@ -406,6 +408,9 @@ dl = DataLoader(
 
 # Optimizer and KL controller
 opt = torch.optim.AdamW(policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
+beta_min, beta_max = 1e-5, 0.2
+kl_ema = None
+kl_ema_momentum = 0.9
 kl_beta = beta
 
 # Mkdir
@@ -467,6 +472,8 @@ while step < max_steps:
         logits_digit2 = logits[batch_idx, digit2_idx_tensor - 1, :]
         reward_first = logits_digit1.gather(1, digit1_tokens_tensor.unsqueeze(1)).squeeze(1)
         reward_second = logits_digit2.gather(1, digit2_tokens_tensor.unsqueeze(1)).squeeze(1)
+        reward_first = reward_first.clamp(min=-20, max=20)
+        reward_second = reward_second.clamp(min=-20, max=20)
 
         first_is_preferred = digit1_tokens_tensor == preferred_token_id
         rc = torch.where(first_is_preferred, reward_first, reward_second)
@@ -487,12 +494,21 @@ while step < max_steps:
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
+        for p_ in policy.parameters():
+            if p_.grad is not None:
+                p_.grad.nan_to_num_(nan=0.0, posinf=1.0, neginf=-1.0)
         opt.step()
         
         # KL controller: target absolute KL (chosen) for stability
         with torch.no_grad():
             kl_now = kl_c.mean().item()
-            kl_beta *= math.exp(beta_gain * (kl_now - target_kl))
+            if kl_ema is None:
+                kl_ema = kl_now
+            else:
+                kl_ema = kl_ema_momentum * kl_ema + (1 - kl_ema_momentum) * kl_now
+            step_raw = beta_gain * (kl_ema - target_kl)
+            step_clipped = max(-0.2, min(0.2, step_raw))
+            kl_beta = max(beta_min, min(beta_max, kl_beta * math.exp(step_clipped)))
         
         # Logging
         if step % log_every == 0:

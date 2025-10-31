@@ -202,8 +202,8 @@ def build_dual_sequences(
         + len(response_b_prefix_ids)
         + len(response_b_suffix_ids)
         + rating_prompt_len
-        + 2  # digits
-    )
+        # + 2  # digits
+    )  # digits appended later - untested
 
     if fixed_overhead >= max_len:
         raise ValueError("max_len too small for dual-response format")
@@ -285,7 +285,8 @@ def build_dual_sequences(
         digit2_idx = len(assembled)
         assembled.append(second_digit)
 
-        assert len(assembled) <= max_len, "Sequence exceeded max_len after appending digits"
+        if len(assembled) > max_len:
+            raise RuntimeError("assembled dual sequence exceeded max_len; adjust budget logic")
 
         sequences.append(assembled)
         digit1_indices.append(digit1_idx)

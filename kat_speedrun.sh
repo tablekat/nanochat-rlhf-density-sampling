@@ -236,8 +236,8 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.kat_train_grpo
     --rm_source=rm \
     --grpo_source=grpo \
     --max_steps=5000 \
-    --learning_rate=1e-5 \
-    --beta=0.1 \
+    --learning_rate=5e-6 \
+    --beta=0.02 \
     --run=${WANDB_RUN}_grpo_uniform
 
 echo "✓ GRPO with regular RM complete"
