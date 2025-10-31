@@ -491,7 +491,7 @@ while step < max_steps:
         rr = torch.where(first_is_preferred, logprob_second, logprob_first)
         
         # Advantage and loss
-        dr = (rc - rr) # * margin_scale
+        dr = (rc - rr) * margin_scale
         dkl = kl_c - kl_r
         A = dr - kl_beta * dkl
         if std_adv:
