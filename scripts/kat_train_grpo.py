@@ -490,12 +490,11 @@ while step < max_steps:
         rr = torch.where(first_is_preferred, logprob_second, logprob_first)
         
         # Advantage and loss
-        dr = (rc - rr)
-        if std_adv:
-            dr = (dr - dr.mean()) / (dr.std(unbiased=False) + 1e-6)
-        
-        dkl = (kl_c - kl_r)
+        dr = rc - rr
+        dkl = kl_c - kl_r
         A = dr - kl_beta * dkl
+        if std_adv:
+            A = (A - A.mean()) / (A.std(unbiased=False) + 1e-6)
         
         loss = -(A.detach() * (lp_c - lp_r)).mean()
         loss = loss.float()
