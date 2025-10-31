@@ -18,6 +18,7 @@ Design notes:
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json, time, math, hashlib
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import glob
@@ -113,6 +114,12 @@ class Pairs(Dataset):
 # ═════════════════════════════════════════════════════════════════════════════
 # Helper functions
 # ═════════════════════════════════════════════════════════════════════════════
+
+def autocast_if_cuda():
+    if device_type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
 
 def truncate_two(p: List[int], r: List[int], max_len: int, min_prompt: int):
     """Trim prompt from left, response from right."""
@@ -273,7 +280,8 @@ def collate(rows: List[PairRow], tokenizer, max_len: int, min_prompt: int, devic
 
 def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Sum log-probs over response tokens (teacher forcing)."""
-    logits = model(x)
+    with autocast_if_cuda():
+        logits = model(x)
     logp = logits.log_softmax(dim=-1)
     tgt = labels[:, 1:].contiguous()
     logp = logp[:, :-1].contiguous()
@@ -283,9 +291,10 @@ def sum_logprobs(model, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 def sum_kl(policy, reference, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """True KL(policy || reference) over response tokens (sum over vocab)."""
-    with torch.no_grad():
-        ref_logits = reference(x)
-    pol_logits = policy(x)
+    with autocast_if_cuda():
+        with torch.no_grad():
+            ref_logits = reference(x)
+        pol_logits = policy(x)
     logp = F.log_softmax(pol_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
     logq = F.log_softmax(ref_logits[:, :-1, :], dim=-1)  # [B,T-1,V]
     p = logp.exp()
@@ -444,7 +453,8 @@ while step < max_steps:
         
         # Rewards (frozen backbone + RM logits)
         with torch.no_grad():
-            logits = reference(rm_inputs)
+            with autocast_if_cuda():
+                logits = reference(rm_inputs)
 
         batch_sz = rm_inputs.size(0)
         batch_idx = torch.arange(batch_sz, device=device)
@@ -471,6 +481,7 @@ while step < max_steps:
         A = dr - kl_beta * dkl
         
         loss = -(A.detach() * (lp_c - lp_r)).mean()
+        loss = loss.float()
         
         # Backward
         opt.zero_grad(set_to_none=True)
