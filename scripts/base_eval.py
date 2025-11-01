@@ -2,10 +2,10 @@
 Evaluate the CORE metric for a given model.
 
 Run on a single GPU:
-python base_eval.py
+python -m scripts.base_eval
 
 Run with torchrun on e.g. 8 GPUs:
-torchrun --nproc_per_node=8 base_eval.py
+torchrun --nproc_per_node=8 -m scripts.base_eval
 
 The script will print the CORE metric to the console.
 """
@@ -13,19 +13,37 @@ import os
 import csv
 import time
 import json
-import random
 import yaml
+import shutil
+import random
+import zipfile
+import tempfile
 from contextlib import nullcontext
 
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 
 # -----------------------------------------------------------------------------
 # nanochat specific function dealing with I/O etc.
+
+# ~162MB of data needed to evaluate the CORE metric
+EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
+
+def place_eval_bundle(file_path):
+    # here file_path is the path to the eval_bundle.zip file
+    # we need to unzip it and place it in the base directory
+    base_dir = get_base_dir()
+    eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            zip_ref.extractall(tmpdir)
+        extracted_bundle_dir = os.path.join(tmpdir, "eval_bundle")
+        shutil.move(extracted_bundle_dir, eval_bundle_dir)
+    print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 def evaluate_model(model, tokenizer, device, max_per_task=-1):
     """
@@ -35,6 +53,9 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
     # Load config and task metadata
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
+    # Download the eval bundle to disk (and unzip if needed)
+    if not os.path.exists(eval_bundle_dir):
+        download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
     eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
