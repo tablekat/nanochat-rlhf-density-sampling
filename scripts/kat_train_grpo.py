@@ -53,7 +53,6 @@ beta = 0.02  # initial KL weight
 target_kl = 0.05  # target per-sample KL
 beta_gain = 0.02  # KL controller update speed
 std_adv = True   # standardize advantage
-margin_scale = 0.1  # rescales RM margin before GRPO
 max_steps = 5000
 log_every = 25
 eval_every = -1  # -1 = disable
@@ -352,7 +351,13 @@ rm = torch.load(rm_head_path, map_location="cpu")
 # for p_ in head.parameters(): # Removed RewardHead
 #     p_.requires_grad_(False) # Removed RewardHead
 
-# If RM training also fine-tuned transformer blocks, load them into policy/reference
+# Build separate reward backbone (keeps policy/reference untouched)
+reward_backbone, _, _ = load_model(source="sft", device=device, phase="eval")
+reward_backbone.eval()
+for p in reward_backbone.parameters():
+    p.requires_grad_(False)
+
+# If RM training also fine-tuned transformer blocks, load them into reward backbone
 blocks_state = rm.get("backbone_blocks_state_dict")
 if blocks_state is not None:
     indices = rm.get("meta", {}).get("backbone_block_indices")
@@ -361,7 +366,7 @@ if blocks_state is not None:
         block_idx = rm.get("meta", {}).get("backbone_block_index", -1)
         indices = [block_idx]
         blocks_state = {str(block_idx): rm.get("backbone_block_state_dict")}
-    print0(f"Applying reward-model backbone blocks {indices} to policy/reference")
+    print0(f"Applying reward-model backbone blocks {indices} to reward backbone")
     for idx in indices:
         state = blocks_state.get(str(idx))
         if state is None:
@@ -371,10 +376,8 @@ if blocks_state is not None:
             target_dtype = next(block.parameters()).dtype
             return {k: v.to(target_dtype) for k, v in state_dict.items()}
 
-        policy_state = _cast_state(policy.transformer.h[idx], state)
-        reference_state = _cast_state(reference.transformer.h[idx], state)
-        policy.transformer.h[idx].load_state_dict(policy_state)
-        reference.transformer.h[idx].load_state_dict(reference_state)
+        reward_state = _cast_state(reward_backbone.transformer.h[idx], state)
+        reward_backbone.transformer.h[idx].load_state_dict(reward_state)
 
 meta = rm.get("meta", {})
 rating_prompt = meta.get("rating_prompt", "\nRating (Response A first, Response B second):")
@@ -464,38 +467,32 @@ while step < max_steps:
         # Rewards (frozen backbone + RM logits)
         with torch.no_grad():
             with autocast_if_cuda():
-                logits = reference(rm_inputs)
+                logits = reward_backbone(rm_inputs)
 
         batch_sz = rm_inputs.size(0)
         batch_idx = torch.arange(batch_sz, device=device)
         digit1_idx_tensor = torch.tensor(digit1_idx, dtype=torch.long, device=device)
         digit2_idx_tensor = torch.tensor(digit2_idx, dtype=torch.long, device=device)
         
-        # Logits at the positions that PREDICT the two digits
-        logits_digit1 = logits[batch_idx, digit1_idx_tensor - 1, :].float()  # [B, V]
-        logits_digit2 = logits[batch_idx, digit2_idx_tensor - 1, :].float()  # [B, V]
+        # Logits at the positions that predict the two digits
+        logits_digit1 = logits[batch_idx, digit1_idx_tensor - 1, :]
+        logits_digit2 = logits[batch_idx, digit2_idx_tensor - 1, :]
 
-        # Full-vocab log-probs per slot
-        logp1 = F.log_softmax(logits_digit1, dim=-1)  # [B, V]
-        logp2 = F.log_softmax(logits_digit2, dim=-1)  # [B, V]
+        digit1_tokens_tensor = torch.tensor(digit1_tokens, dtype=torch.long, device=device)
+        digit2_tokens_tensor = torch.tensor(digit2_tokens, dtype=torch.long, device=device)
 
-        # Token IDs for pref/rej (scalar IDs)
-        pref_id = torch.tensor([preferred_token_id], device=device)
-        rej_id  = torch.tensor([rejected_token_id],  device=device)
+        log_probs_digit1 = logits_digit1.float().log_softmax(dim=-1)
+        log_probs_digit2 = logits_digit2.float().log_softmax(dim=-1)
 
-        # Gather four log-probs (two tokens at each slot)
-        lp_pref1 = logp1.gather(1, pref_id.expand(batch_sz,1)).squeeze(1)   # log p(pref | slot1)
-        lp_rej1  = logp1.gather(1, rej_id .expand(batch_sz,1)).squeeze(1)   # log p(rej  | slot1)
-        lp_pref2 = logp2.gather(1, pref_id.expand(batch_sz,1)).squeeze(1)   # log p(pref | slot2)
-        lp_rej2  = logp2.gather(1, rej_id .expand(batch_sz,1)).squeeze(1)   # log p(rej  | slot2)
+        logprob_first = log_probs_digit1.gather(1, digit1_tokens_tensor.unsqueeze(1)).squeeze(1)
+        logprob_second = log_probs_digit2.gather(1, digit2_tokens_tensor.unsqueeze(1)).squeeze(1)
+        logprob_first = logprob_first.clamp(min=-10, max=10)
+        logprob_second = logprob_second.clamp(min=-10, max=10)
 
-        # Symmetric pairwise margin
-        margin = (lp_pref1 + lp_rej2) - (lp_rej1 + lp_pref2)
-        margin = margin.clamp(-10, 10)  # optional safety
-
-        rc = 0.5 * margin
-        rr = -0.5 * margin
-        dr = margin   # no extra scaling needed; drop margin_scale
+        first_is_pref = digit1_tokens_tensor == preferred_token_id
+        rc = torch.where(first_is_pref, logprob_first, logprob_second)
+        rr = torch.where(first_is_pref, logprob_second, logprob_first)
+        dr = rc - rr  # reward margin from digit log-probs
 
         # Advantage and loss
         dkl = kl_c - kl_r
