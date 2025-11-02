@@ -20,9 +20,8 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
-
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data):
-    assert int(os.environ.get('RANK', 0)) == 0  # prevent footguns for now
+    assert int(os.environ.get('RANK', 0)) == 0 # prevent footguns for now
     os.makedirs(checkpoint_dir, exist_ok=True)
     # Save the model state (parameters)
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
