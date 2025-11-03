@@ -34,7 +34,7 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data)
         log0(f"Saved optimizer file to: {optimizer_path}")
     # Save the metadata dict as json
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "w", encoding='utf-8') as f:
+    with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta_data, f, indent=2)
     log0(f"Saved metadata file to: {meta_path}")
 
@@ -50,7 +50,7 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False):
         optimizer_data = torch.load(optimizer_path, map_location=device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "r", encoding='utf-8') as f:
+    with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
 
