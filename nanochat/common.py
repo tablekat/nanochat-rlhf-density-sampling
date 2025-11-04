@@ -70,7 +70,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     if os.path.exists(file_path):
         return file_path
 
-    with open(lock_path, 'w') as lock_file:
+    with open(lock_path, 'w', encoding='utf-8') as lock_file:
 
         # Only a single rank can acquire this lock
         # All other ranks block until it is released
