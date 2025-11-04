@@ -5,10 +5,10 @@ Common utilities for nanochat.
 import os
 import re
 import logging
-import fcntl
 import urllib.request
 import torch
 import torch.distributed as dist
+from filelock import FileLock
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
@@ -70,11 +70,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     if os.path.exists(file_path):
         return file_path
 
-    with open(lock_path, 'w') as lock_file:
-
-        # Only a single rank can acquire this lock
-        # All other ranks block until it is released
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    with FileLock(lock_path):
 
         # Recheck after acquiring lock (another process may have downloaded it)
         if os.path.exists(file_path):
@@ -93,12 +89,6 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         # Run the postprocess function if provided
         if postprocess_fn is not None:
             postprocess_fn(file_path)
-
-    # Clean up the lock file after the lock is released
-    try:
-        os.remove(lock_path)
-    except OSError:
-        pass  # Ignore if already removed by another process
 
     return file_path
 
