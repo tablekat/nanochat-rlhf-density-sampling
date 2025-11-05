@@ -71,8 +71,10 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         return file_path
 
     with FileLock(lock_path):
+        # Only a single rank can acquire this lock
+        # All other ranks block until it is released
 
-        # Recheck after acquiring lock (another process may have downloaded it)
+        # Recheck after acquiring lock
         if os.path.exists(file_path):
             return file_path
 
