@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import glob
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
@@ -56,6 +55,14 @@ std_adv = True   # standardize advantage
 max_steps = 5000
 log_every = 25
 eval_every = -1  # -1 = disable
+
+# On-policy generation
+generation_max_new_tokens = 128
+generation_temperature_policy = 1.0
+generation_top_k_policy = None
+generation_temperature_reference = 0.0
+generation_top_k_reference = None
+generation_seed = 1337
 
 # Data
 pairs_path = None  # Auto-resolved
@@ -388,6 +395,18 @@ tokenizer = get_tokenizer()
 ds = Pairs(Path(pairs_path))
 pad_id = tokenizer.encode_special("<|assistant_end|>")
 
+assistant_end_id = tokenizer.encode_special("<|assistant_end|>")
+
+
+def generate_completion_tokens(model, prefix_ids, max_new_tokens, temperature, top_k, seed):
+    tokens = []
+    prefix_copy = list(prefix_ids)
+    for token in model.generate(prefix_copy, max_tokens=max_new_tokens, temperature=temperature, top_k=top_k, seed=seed):
+        tokens.append(token)
+        if assistant_end_id is not None and token == assistant_end_id:
+            break
+    return tokens
+
 response_a_prefix_ids = tokenizer.encode("\n### Response A ###\n")
 response_a_suffix_ids = tokenizer.encode("\n### End Response A ###\n")
 response_b_prefix_ids = tokenizer.encode("\n### Response B ###\n")
@@ -439,6 +458,47 @@ while step < max_steps:
         if step > max_steps:
             break
         
+        # On-policy generation: create fresh chosen/rejected responses
+        generated_rows = []
+        policy.eval()
+        for idx, row in enumerate(rows):
+            prefix_ids = render_prefix_for_completion(tokenizer, row.prefix)
+            seed_offset = generation_seed + step * batch_size + idx + ddp_rank * 1_000_000
+
+            policy_tokens = generate_completion_tokens(
+                policy,
+                prefix_ids,
+                generation_max_new_tokens,
+                generation_temperature_policy,
+                generation_top_k_policy,
+                seed_offset,
+            )
+            reference_tokens = generate_completion_tokens(
+                reference,
+                prefix_ids,
+                generation_max_new_tokens,
+                generation_temperature_reference,
+                generation_top_k_reference,
+                seed_offset + 1,
+            )
+
+            if not policy_tokens:
+                policy_tokens = tokenizer.encode(" ")
+            if not reference_tokens:
+                reference_tokens = tokenizer.encode(" ")
+
+            policy_text = tokenizer.decode(policy_tokens, skip_special_tokens=False)
+            reference_text = tokenizer.decode(reference_tokens, skip_special_tokens=False)
+
+            generated_rows.append(PairRow({
+                "prefix": row.prefix,
+                "chosen": policy_text,
+                "rejected": reference_text,
+            }))
+        policy.train()
+
+        rows = generated_rows
+
         x_c, y_c, x_r, y_r = collate(rows, tokenizer, max_len, min_prompt, device)
         rm_inputs, digit1_idx, digit2_idx, digit1_tokens, digit2_tokens = build_dual_sequences(
             rows,
