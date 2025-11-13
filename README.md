@@ -201,6 +201,7 @@ Current LLM policy: disclosure. When submitting a PR, please declare any parts t
 - Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
 - Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
 - Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
+- Thank you to the repo czar Sophie [@svlandeg](https://github.com/svlandeg) for help with managing issues, pull requests and discussions of nanochat.
 
 ## Cite
 
