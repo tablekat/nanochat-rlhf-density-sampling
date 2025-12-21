@@ -250,8 +250,8 @@ for step in range(num_iterations):
 if master_process:
     base_dir = get_base_dir()
     depth = model.config.n_layer
-    model_tag = f"d{depth}" # base the model tag on the depth of the base model
-    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
+    output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
     model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
     save_checkpoint(
         checkpoint_dir,

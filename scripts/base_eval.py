@@ -27,6 +27,14 @@ from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 
+# Configuration
+hf_path = None # optional HuggingFace model path to evaluate
+max_per_task = -1  # max examples per task to evaluate (-1 = disable)
+model_tag = None # optional model tag for the output directory name
+model_step = None # optional model step for the output directory name
+device_type = "" # cuda|cpu|mps (empty => autodetect)
+exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
+
 # -----------------------------------------------------------------------------
 # nanochat specific function dealing with I/O etc.
 
@@ -145,34 +153,27 @@ def load_hf_model(hf_path: str, device):
 
 # -----------------------------------------------------------------------------
 def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path to evaluate')
-    parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
-    args = parser.parse_args()
-
     # distributed / precision setup
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 
     # Load model and tokenizer from command line or from file system
-    if args.hf_path is not None:
+    if hf_path is not None:
         # atm assume that if a path is given, it's a huggingface model path
-        hf_path = args.hf_path
         print0(f"Loading huggingface model from: {hf_path}")
         model, tokenizer = load_hf_model(hf_path, device)
         model_name = hf_path # just for logging
         model_slug = hf_path.replace("/", "-") # for the output csv file
     else:
         # load a local model from the file system
-        model, tokenizer, meta = load_model("base", device, phase="eval")
+        model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=model_tag, step=model_step)
         model_name = f"base_model (step {meta['step']})" # just for logging
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 
     # Evaluate the model
     with autocast_ctx:
-        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task)
+        out = evaluate_model(model, tokenizer, device, max_per_task=max_per_task)
 
     # Write out the results to a csv file
     core_metric = None
