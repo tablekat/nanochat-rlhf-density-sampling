@@ -10,7 +10,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import wandb
 import torch
