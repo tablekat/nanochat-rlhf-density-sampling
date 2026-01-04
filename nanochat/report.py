@@ -16,8 +16,11 @@ def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
+        # Return stdout if we got output (even if some files in xargs failed)
+        if result.stdout.strip():
             return result.stdout.strip()
+        if result.returncode == 0:
+            return ""
         return None
     except:
         return None
