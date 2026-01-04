@@ -173,10 +173,7 @@ Generated: {timestamp}
         if wc_output:
             total_line = wc_output.strip().split('\n')[-1]
             parts = total_line.split()
-            if 'total' in parts:
-                num_lines = int(parts[0])
-                num_chars = int(parts[1])
-            elif len(parts) >= 2:
+            if len(parts) >= 2:
                 num_lines = int(parts[0])
                 num_chars = int(parts[1])
     num_tokens = num_chars // 4  # assume approximately 4 chars per token
