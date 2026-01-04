@@ -140,7 +140,6 @@ python -m pytest tests/test_engine.py -v -s
 │   ├── adamw.py                    # Distributed AdamW optimizer
 │   ├── checkpoint_manager.py       # Save/Load model checkpoints
 │   ├── common.py                   # Misc small utilities, quality of life
-│   ├── configurator.py             # A superior alternative to argparse
 │   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
 │   ├── dataloader.py               # Tokenizing Distributed Data Loader
 │   ├── dataset.py                  # Download/read utils for pretraining data
