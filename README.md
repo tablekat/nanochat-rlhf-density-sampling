@@ -120,7 +120,7 @@ Alternatively, I recommend using [DeepWiki](https://deepwiki.com/karpathy/nanoch
 I haven't invested too much here but some tests exist, especially for the tokenizer. Run e.g. as:
 
 ```bash
-python -m pytest tests/test_rustbpe.py -v -s
+python -m pytest tests/test_engine.py -v -s
 ```
 
 ## File structure
@@ -179,7 +179,6 @@ python -m pytest tests/test_rustbpe.py -v -s
 │   └── spellingbee.py              # Task teaching model to spell/count letters
 ├── tests
 │   └── test_engine.py
-│   └── test_rustbpe.py
 └── uv.lock
 ```
 
