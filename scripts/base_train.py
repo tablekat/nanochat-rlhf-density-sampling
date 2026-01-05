@@ -47,13 +47,13 @@ parser.add_argument("--target_param_data_ratio", type=int, default=20, help="cal
 # Optimization
 parser.add_argument("--device_batch_size", type=int, default=32, help="per-device batch size")
 parser.add_argument("--total_batch_size", type=int, default=524288, help="total batch size in tokens")
-parser.add_argument("--embedding_lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--embedding_lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding_lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
 parser.add_argument("--matrix_lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--grad_clip", type=float, default=1.0, help="gradient clipping value (0.0 = disabled)")
 parser.add_argument("--warmup_ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
-parser.add_argument("--warmdown_ratio", type=float, default=0.2, help="ratio of iterations for LR warmdown")
+parser.add_argument("--warmdown_ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final_lr_frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume_from_step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
