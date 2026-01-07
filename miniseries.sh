@@ -27,8 +27,11 @@ RESULTS_DIR="$NANOCHAT_BASE_DIR/jan7_miniseries_results"
 mkdir -p "$RESULTS_DIR"
 RESULTS_FILE="$RESULTS_DIR/results.csv"
 
-# Write CSV header
-echo "depth,model_dim,num_params,num_scaling_params,num_iterations,tokens_trained,param_data_ratio,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+# Write CSV header only if file doesn't exist
+if [ ! -f "$RESULTS_FILE" ]; then
+    echo "depth,model_dim,num_params,num_scaling_params,num_iterations,tokens_trained,param_data_ratio,val_bpb,core_score,train_time_sec" > "$RESULTS_FILE"
+fi
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
