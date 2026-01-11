@@ -134,6 +134,11 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
+        """
+        NOTE a major footgun: this __init__ function runs in meta device context (!!)
+        Therefore, any calculations inside here are shapes and dtypes only, no actual data.
+        => We actually initialize all data (parameters, buffers, etc.) in init_weights() instead.
+        """
         super().__init__()
         self.config = config
         # For DDP, we want vocab_size divisible by world_size. Also, there are potential performance benefits, see:
@@ -146,6 +151,12 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Per-layer learnable scalars (inspired by modded-nanogpt)
+        # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
+        # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
+        # Separate parameters so they can have different optimizer treatment
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -185,6 +196,11 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        # Per-layer scalars
+        with torch.no_grad():
+            self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
+            self.x0_lambdas.fill_(0.0)      # 0.0 => skip connection to input is disabled at init
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -244,21 +260,25 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         return nparams
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95)):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        # Separate out all parameters into 5 groups (matrix, embedding, lm_head, resid_lambdas, x0_lambdas)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
-        # Create the AdamW optimizer for the embedding and lm_head
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(resid_params) + len(x0_params)
+        # Create the AdamW optimizer for the embedding, lm_head, and per-layer scalars
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            dict(params=resid_params, lr=scalar_lr * 0.01), # these are a lot more sensitive because they accumulate in the residual stream
+            dict(params=x0_params, lr=scalar_lr),
         ]
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
@@ -288,7 +308,9 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
-        for block in self.transformer.h:
+        x0 = x  # save initial normalized embedding for x0 residual
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
