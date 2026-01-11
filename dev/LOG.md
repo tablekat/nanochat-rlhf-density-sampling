@@ -4,6 +4,22 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-11: Sliding Window Attention
+
+Added configurable sliding window attention, inspired by GPT-3's alternating short/long pattern.
+
+**Pattern string configuration:**
+- New `--window_pattern` CLI arg and `GPTConfig.window_pattern` field
+- Pattern is tiled across layers (e.g., `SSSL` for 20 layers → `SSSLSSSLSSSLSSSLSSSL`)
+- Final layer always forced to L (full context) regardless of pattern
+- Short window = `sequence_len // 2`
+- Long window = `sequence_len` (full context)
+- All previous models so far have been simply `L` and checkpoint loading is modified accordingly to fill in this param for old models, see `_patch_missing_config_keys`
+
+Quick experiments showed `SSSL` (every 4th layer is long) works well - provides a good balance between compute savings and model quality. This is now the default.
+
+---
+
 ## 2026-01-11: Flash Attention 3 Integration
 
 Replaced PyTorch's `scaled_dot_product_attention` (FA2) with Flash Attention 3 for training and inference.
