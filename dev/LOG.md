@@ -4,6 +4,39 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-11: Flash Attention 3 Integration
+
+Replaced PyTorch's `scaled_dot_product_attention` (FA2) with Flash Attention 3 for training and inference.
+
+### Changes Made
+
+**1. FA3 via `kernels` package**
+- Official FA3 is "beta" and requires building from source (painful)
+- Using `kernels` package from HuggingFace Hub: `get_kernel('varunneal/flash-attention-3')`
+- Loads pre-built wheels, works out of the box on H100
+
+**2. Simplified attention code**
+- FA3 uses `(B, T, H, D)` layout matching our projection output directly - no transpose needed
+- Training: `flash_attn.flash_attn_func(q, k, v, causal=True)`
+- Inference: `flash_attn.flash_attn_with_kvcache()` handles all cache cases in one call
+- Removed 3 separate FA2 code paths (training, single-token, chunk inference)
+- GQA handled automatically when n_kv_heads < n_heads
+
+**3. Rewrote KVCache for FA3**
+- Old format: `(num_layers, 2, B, H, T, D)` combined tensor
+- New format: separate `k_cache` and `v_cache` of shape `(num_layers, B, T, H, D)`
+- FA3 updates cache in-place during `flash_attn_with_kvcache`
+- Position tracked via `cache_seqlens` tensor (int32, per batch element)
+- Simpler API: `get_layer_cache()`, `advance()`, `reset()`, `prefill()`
+
+### Results
+
+- **~9% improvement in tok/sec** during training out of the box
+- Benchmarks showed FA3 is 2x faster than FA2 at realistic training sizes (batch=32, seq=2048)
+- FA3 supports sliding window via `window_size=(left, 0)`, which is huge and expected to give further improvements. This is ready to tune but keeping full context for now.
+
+---
+
 ## 2026-01-11: Per-Layer Residual Scalars (x0 & resid lambdas)
 
 Cherry-picked an idea from modded-nanogpt around learnable per-layer residual connections.
