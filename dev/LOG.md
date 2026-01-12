@@ -4,6 +4,32 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-12: Multi-Token Prediction (MTP)
+
+Ported multi-token prediction from modded-nanogpt. Instead of predicting just the next token, predict the next n tokens at each position with weighted loss.
+
+### Implementation
+
+- Instead of calling the loss `n_predict` times, uses a fancy batched computation using `unfold` + `gather` + cross-entropy decomposition (`CE = logsumexp - logits[target]`)
+- Schedule anneals from 3-token to 1-token prediction:
+  - 0-33%: `[1.0, 0.5, 0.25→0]` (3rd token fades)
+  - 33-67%: `[1.0, 0.5→0]` (2nd token fades)
+  - 67-100%: `[1.0]` (standard next-token)
+- Weights normalized to sum to 1
+
+### Results (d12)
+
+| Metric | Baseline | MTP |
+|--------|----------|-----|
+| GPU Memory | 34 GB | 47 GB |
+| MFU | 41% | 40% |
+| val/bpb (per step) | baseline | same/slightly worse |
+| val/bpb (wall clock) | baseline | noticeably worse |
+
+**Conclusion:** Negative result for nanochat. The extra memory and compute overhead from predicting multiple tokens doesn't pay off, in fact the results get worse. The auxiliary loss signal may help in other settings (larger models, different architectures?), but for our setup it's pure overhead at the moment.
+
+---
+
 ## 2026-01-11: Sliding Window Attention
 
 Added configurable sliding window attention, inspired by GPT-3's alternating short/long pattern.
