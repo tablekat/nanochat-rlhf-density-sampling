@@ -103,9 +103,10 @@ class HuggingFaceTokenizer:
     def id_to_token(self, id):
         return self.tokenizer.id_to_token(id)
 
-    def _encode_one(self, text, prepend=None, append=None):
+    def _encode_one(self, text, prepend=None, append=None, num_threads=None):
         # encode a single string
         # prepend/append can be either a string of a special token or a token id directly.
+        # num_threads is ignored (only used by the nanochat Tokenizer for parallel encoding)
         assert isinstance(text, str)
         ids = []
         if prepend is not None:
