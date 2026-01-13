@@ -4,6 +4,21 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-13: Number Token Split Pattern
+
+Validated the `\p{N}{1,2}` pattern in `SPLIT_PATTERN` (tokenizer.py line 30), which I only guessed earlier and had a TODO for to validate. GPT-4 uses `\p{N}{1,3}` to group number sequences of up to 3 digits into tokens, but we suspected smaller vocab sizes benefit from grouping fewer digits per token.
+
+**Results (d12, vocab=32K):**
+| Pattern | val_bpb |
+|---------|---------|
+| `\p{N}{1,1}` | 0.969 |
+| `\p{N}{1,2}` | **0.965** |
+| `\p{N}{1,3}` | 0.972 |
+
+**Conclusion:** `{1,2}` is optimal for vocab size 32K. Grouping 3 digits wastes tokens on rare 3-digit combinations; grouping 1 digit is too fine-grained and bloats token sequences. Keeping `{1,2}` as default.
+
+---
+
 ## 2026-01-13: FP8 Training for lm_head
 
 Attempted to use FP8 (8-bit floating point) for the lm_head layer to speed up the large vocab projection matmul. H100 GPUs have FP8 tensor cores that can theoretically provide ~2x speedup over BF16.
