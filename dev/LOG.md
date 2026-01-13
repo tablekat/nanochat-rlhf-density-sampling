@@ -4,6 +4,70 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-13: BOS-Aligned Dataloader with Bin Packing
+
+Redesigned the pretraining and midtraining dataloader to ensure every sequence starts with a BOS token, and explored bin-packing algorithms to minimize wasted tokens.
+
+### Problem Statement
+
+The original dataloader streams tokens into a flat buffer and reshapes into batches. This means some rows start mid-document (no BOS), which could confuse the model during training. We want every row to start with BOS and contain well-formed documents.
+
+### Approach 1: Greedy-Crop BOS (Simple)
+
+Each row is built independently:
+- Start with a document (which has BOS prepended)
+- Pack more documents until row is full
+- If a document doesn't fit, **crop it** to fill remaining space (discard the rest)
+- 100% utilization (no padding), but wastes cropped tokens
+
+### Waste Analysis
+
+Measured token waste empirically on real data (T=2048):
+- **39.4% of tokens are cropped** (discarded when docs don't fit)
+- **22.9% is the theoretical minimum** (tokens in docs longer than T+1 that can never fit)
+- The extra ~16.5% comes from "unlucky" cropping when a long doc starts near the end of a row
+
+### Bin Packing Algorithms Explored
+
+| Algorithm | Util% | Crop% | Pad% | Notes |
+|-----------|-------|-------|------|-------|
+| Greedy-Crop (baseline) | 100% | 39.4% | 0% | Simple, no wasted compute |
+| Greedy-Pad | 78% | 23.0% | 22% | Pads instead of crops - wastes compute |
+| First-Fit Decreasing (FFD) | 99.7% | 23.0% | 0.3% | Near-optimal packing, minimal padding |
+| **BestFit-Crop** | 100% | 34.6% | 0% | Smart cropping, no padding |
+
+### BestFit-Crop Algorithm
+
+A middle ground that maintains 100% utilization while reducing cropping:
+
+1. Buffer N documents
+2. For each row, greedily pick the **largest doc that fits entirely**
+3. Repeat until nothing fits
+4. When nothing fits, crop a doc to fill remaining space exactly
+
+This avoids "unlucky" crops by searching the buffer for better-fitting documents.
+
+**Results (T=2048):**
+- Crop waste reduced from 39.4% → 34.6% (~12% relative improvement)
+- Still achieves 100% utilization (no padding, every token trains)
+- Slightly more rows than baseline (uses more documents per batch)
+
+### Decision: Keep Two Implementations
+
+1. Keep the original implementation which is very simple, efficient and has 100% token utilization in the batch (no padding with ignore tokens), but creates slightly more confusing token streams for the LLM because documents during training can start abruptly from the middle with no context. Note that this never happens at test time, where BOS is always present.
+
+2. **`_bos_bestfit` (BestFit-Crop, new default)**: Slightly more complex but still keeps 100% token utilization in the batch (no padding), but at the cost of discarding documents when they don't fit. In practice, about 34% of tokens are discarded with this approach. This is ok because for most models we care about we have plenty of data without having to go to multiple epochs. One more subtle effect is that it does skew the data distribution a tiny bit because, reliably and necessarily, tokens at the tails of long documents will be discarded. However, this doesn't seem to impact actual downstream performance.
+
+### Midtraining
+
+The midtraining dataloader was also updated. Because conversations are on average a lot shorter than pretraining documents, only about 3.3% of tokens get cropped.
+
+### NOTE: loss scale
+
+Do note that switching to the BOS dataloader changes the validation loss and makes all previous experiments not comparable in absolute value of the loss, because we have a lot fewer "confusing" tokens in the train/val batches. All tokens can look back and find the BOS token and have the full context of that document to make predictions. Therefore, the loss appears lower but this is "fake" to some extent, and the expectation is that the vast majority of relative comparisons done so far would agree with those before and after this change.
+
+---
+
 ## 2026-01-13: Number Token Split Pattern
 
 Validated the `\p{N}{1,2}` pattern in `SPLIT_PATTERN` (tokenizer.py line 30), which I only guessed earlier and had a TODO for to validate. GPT-4 uses `\p{N}{1,3}` to group number sequences of up to 3 digits into tokens, but we suspected smaller vocab sizes benefit from grouping fewer digits per token.

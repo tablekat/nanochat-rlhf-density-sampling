@@ -20,8 +20,8 @@ curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-publ
 
 # train tokenizer on ~4B characters and kick off download of the rest for pretraining
 python -m nanochat.dataset -n 16
-# start downloading the rest of the shards for a total of 800 (see below why 800)
-python -m nanochat.dataset -n 800 &
+# start downloading the rest of the shards for a total of 1200 (see below why 1200)
+python -m nanochat.dataset -n 1200 &
 # todo: download the rest of it
 python -m scripts.tok_train --max_chars=4000000000 --vocab_size=65536
 python -m scripts.tok_eval
@@ -62,7 +62,9 @@ python -m scripts.tok_eval
 # The tok_eval.py script reports about ~4.8 chars/token on average for the default tokenizer settings.
 # So ~38B tokens # ~4.8 chars/token = ~185B chars.
 # Each data shard is ~250M chars, so we need ~185B / 250M ~= 740 shards.
-# For safety, I bumped that up to 800 shards, and that's why up above I used -n 800 when pre-downloading dataset shards.
+# For safety, I bumped that up to 800 shards.
+# The new DataLoader wastes about 35% of tokens to cropping, so 800 / (1 - 0.35) ~= 1200 shards are needed.
+# => why up above I used -n 1200 when pre-downloading dataset shards.
 # If we didn't have enough data, the training script would loop around and do multiple epochs over the same data,
 # which would decrease model performance. Possibly 2, 3 or so epochs is ~ok, but certainly not ideal and at 10+ epochs we'd
 # start to overfit hard.
