@@ -6,7 +6,7 @@ python -m scripts.mid_train
 
 Or torchrun for training:
 
-torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_size=16
+torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device-batch-size=16
 """
 
 import argparse
@@ -36,28 +36,28 @@ parser = argparse.ArgumentParser(description="Midtrain the model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device_type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
 # Model loading
-parser.add_argument("--model_tag", type=str, default=None, help="model tag to load from")
-parser.add_argument("--model_step", type=int, default=None, help="model step to load from")
+parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
+parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 # Training horizon
-parser.add_argument("--num_iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
+parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes
-parser.add_argument("--max_seq_len", type=int, default=2048, help="max context length")
-parser.add_argument("--device_batch_size", type=int, default=32, help="per-device batch size")
-parser.add_argument("--total_batch_size", type=int, default=524288, help="total batch size in tokens")
+parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size")
+parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 # Optimization
-parser.add_argument("--embedding_lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding_lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--matrix_lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
-parser.add_argument("--init_lr_frac", type=float, default=1.0, help="initial LR as fraction of base LR")
+parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
+parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding parameters (Adam)")
+parser.add_argument("--init-lr-frac", type=float, default=1.0, help="initial LR as fraction of base LR")
 # Evaluation
-parser.add_argument("--eval_every", type=int, default=150, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval_tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-every", type=int, default=150, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
 # Output
-parser.add_argument("--dry_run", action="store_true", help="log to wandb but skip checkpoints/report")
+parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -79,7 +79,7 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-mi
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
 pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:
-    print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
+    print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device-batch-size to this script?")
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
@@ -142,7 +142,8 @@ def mid_data_generator_bos_bestfit(split, buffer_size=100):
 
     # Conversation buffer: list of token lists
     conv_buffer = []
-    cursor = ddp_rank  # Each rank processes different conversations
+    cursor = ddp_rank  # Each rank processes different conversations (for fetching)
+    consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
     it = 0  # iteration counter
 
@@ -156,8 +157,7 @@ def mid_data_generator_bos_bestfit(split, buffer_size=100):
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
                 epoch += 1
-                if split == "train":
-                    last_step = True  # toggle last_step to True, which will terminate the training loop
+                # Note: last_step is now triggered based on consumption, not fetching
 
     while True:
         rows = []
@@ -183,10 +183,12 @@ def mid_data_generator_bos_bestfit(split, buffer_size=100):
                     # Found a conversation that fits - use it entirely
                     conv = conv_buffer.pop(best_idx)
                     row.extend(conv)
+                    consumed += ddp_world_size  # Track actual consumption
                 else:
                     # No conversation fits - crop first conversation to fill remaining
                     conv = conv_buffer.pop(0)
                     row.extend(conv[:remaining])
+                    consumed += ddp_world_size  # Track actual consumption
 
             rows.append(row[:row_capacity])
 
@@ -195,13 +197,16 @@ def mid_data_generator_bos_bestfit(split, buffer_size=100):
         if 0 < args.num_iterations <= it and split == "train":
             last_step = True
 
-        # Update progress tracking
+        # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
             if args.num_iterations > 0:
                 approx_progress = it / args.num_iterations
             else:
-                approx_progress = cursor / dataset_size
+                approx_progress = consumed / dataset_size
+            # Trigger last_step when we've consumed enough (instead of when cursor wraps)
+            if consumed >= dataset_size:
+                last_step = True
 
         # Build tensors
         use_cuda = device_type == "cuda"

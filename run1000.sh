@@ -23,15 +23,15 @@ python -m nanochat.dataset -n 16
 # start downloading the rest of the shards for a total of 1200 (see below why 1200)
 python -m nanochat.dataset -n 1200 &
 # todo: download the rest of it
-python -m scripts.tok_train --max_chars=4000000000 --vocab_size=65536
+python -m scripts.tok_train --max-chars=4000000000 --vocab-size=65536
 python -m scripts.tok_eval
 
 # Documenting my process for determining the hyperparameters for this run1000.sh script:
 # We want a budget of approx. $1000 ~= 41.6 hours of 8XH100 compute
 # 1) I guessed the model size for this to be about depth=32
 # 2) Determine the device_batch_size that fits:
-# Running the base_train.py script with --depth=32, I saw that --device_batch_size=16
-# runs out of memory, but --device_batch_size=8 fits. Inspecting `nvidia-smi` during training,
+# Running the base_train.py script with --depth=32, I saw that --device-batch-size=16
+# runs out of memory, but --device-batch-size=8 fits. Inspecting `nvidia-smi` during training,
 # I saw all GPUs were at about 78/80GB VRAM, so it just barely fits and we have good MFU at ~50%.
 # So the training script was running ok and showed:
 # Vocab size: 65,536
@@ -73,13 +73,13 @@ python -m scripts.tok_eval
 # Number of processes/GPUs to use
 NPROC_PER_NODE=8
 
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=32 --target_param_data_ratio=20 --device_batch_size=8 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=32 --target-param-data-ratio=20 --device-batch-size=8 --run=$WANDB_RUN
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_eval
 
 # midtrain
 # NOTE: ensure that we use the same device_batch_size here as the base training script.
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --device_batch_size=8 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.mid_train -- --device-batch-size=8 --run=$WANDB_RUN
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_eval -- -i mid
 
 # sft
