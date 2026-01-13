@@ -14,7 +14,7 @@ from contextlib import nullcontext
 import torch
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import compute_init, print0, compute_cleanup, autodetect_device_type
-from nanochat.dataloader import tokenizing_distributed_data_loader
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.tokenizer import get_token_bytes, HuggingFaceTokenizer
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -97,7 +97,7 @@ assert args.split_tokens % tokens_per_step == 0, "split_tokens must be divisible
 steps = args.split_tokens // tokens_per_step
 bpb_results = {}
 for split_name in ["train", "val"]:
-    loader = tokenizing_distributed_data_loader(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+    loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
     with autocast_ctx:
         bpb = evaluate_bpb(model, loader, steps, token_bytes)
     print0(f"{split_name} bpb: {bpb:.4f}")
