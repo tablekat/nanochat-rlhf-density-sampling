@@ -4,6 +4,36 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-13: Varlen Attention (Negative Result)
+
+Attempted to prevent attention from "leaking" across document boundaries using Flash Attention's `flash_attn_varlen_func`, similar to modded-nanogpt's approach.
+
+### Background
+
+With the BOS-aligned dataloader, multiple documents are packed into each row. Standard attention allows tokens to attend across document boundaries within a row. The hypothesis was that preventing this "leakage" via varlen attention might improve training.
+
+### Approach: Compute cu_seqlens from inputs
+
+- Find BOS positions: `(inputs.view(-1) == bos_token_id).nonzero()`
+- Gotcha 1: Variable-length `cu_seqlens` caused torch.compile recompilation (25s/iter!) - fixed by padding to fixed size
+- Gotcha 2: `nonzero()` inside compiled model hit recompile limit - fixed by moving computation outside compiled region
+
+### Final Results (d16)
+
+| Metric | Baseline | Varlen |
+|--------|----------|--------|
+| val_bpb | 0.85427 | 0.85407 |
+| MFU | ~same | ~same |
+| tok/sec | ~same | ~same |
+
+Essentially identical. The 0.0002 bpb improvement is almost noise.
+
+### Conclusion
+
+Not worth the code complexity. The "leakage" across document boundaries within a row is not harmful - the model handles it fine. The BOS-aligned dataloader already provides the key benefit (every row starts with proper context). Not merging to master.
+
+---
+
 ## 2026-01-13: BOS-Aligned Dataloader with Bin Packing
 
 Redesigned the pretraining and midtraining dataloader to ensure every sequence starts with a BOS token, and explored bin-packing algorithms to minimize wasted tokens.
