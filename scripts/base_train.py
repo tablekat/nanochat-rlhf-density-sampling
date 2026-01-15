@@ -370,14 +370,15 @@ while True:
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
-    # logging
+    # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(args.total_batch_size / dt)
