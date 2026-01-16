@@ -27,6 +27,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_model
 print_banner()
 
@@ -85,6 +86,18 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+
+# Flash Attention status
+if HAS_FA3:
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+else:
+    print0("!" * 80)
+    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
+    print0("WARNING: Training will be less efficient without FA3")
+    if args.window_pattern != "L":
+        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
+        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
+    print0("!" * 80)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()
