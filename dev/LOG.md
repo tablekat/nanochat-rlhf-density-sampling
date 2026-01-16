@@ -4,6 +4,50 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-16: Flash Attention 3 Fallback to SDPA
+
+Added automatic fallback from Flash Attention 3 to PyTorch's `scaled_dot_product_attention` (SDPA) for users without Hopper GPUs. This enables nanochat to run on older CUDA GPUs, CPU, and MPS (Apple Silicon).
+
+### Implementation
+
+Created `nanochat/flash_attention.py` - a unified interface that:
+- Detects FA3 availability at import time (requires sm90+ / Hopper)
+- Exports a `flash_attn` object matching FA3's API exactly (`flash_attn.flash_attn_func`, `flash_attn.flash_attn_with_kvcache`)
+- Automatically routes to FA3 or SDPA based on hardware
+- Handles tensor layout differences: FA3 uses (B, T, H, D), SDPA uses (B, H, T, D)
+- Implements sliding window attention via explicit masks for SDPA
+- Manages KV cache manually for SDPA (FA3 does it in-place)
+
+### Changes to Existing Files
+
+Changes to existing code were intentionally kept extremely minimal.
+
+**gpt.py**: Only the import line changed and a comment
+
+**engine.py**: Zero changes needed
+
+**base_train.py**: Added status print and warnings:
+- Prints whether FA3 or SDPA fallback is being used
+- Warns about efficiency loss without FA3
+- Warns about sliding window support if `--window-pattern` is not "L"
+
+### Testing
+
+Tests are split into two classes due to dtype/device constraints:
+
+1. **TestFA3VsSDPA**: Comparison tests requiring Hopper GPU + bfloat16. Run both implementations on identical inputs and verify outputs match (max diff typically 0, at most ~0.004 for sliding window).
+
+2. **TestSDPAOnly**: SDPA-only tests that run on any device with appropriate dtype. Verify forward pass, backward pass, and KV cache work correctly.
+
+Added `_override_impl` mechanism for testing - can force 'fa3' or 'sdpa' to directly compare implementations.
+
+### Notes
+
+- SDPA fallback is significantly slower than FA3 especially in that it lacks the sliding window attention support
+- Recommend `--window-pattern L` (full context) when using SDPA fallback
+
+---
+
 ## 2026-01-16: Modded-nanogpt Ideas Sweep (Mostly Negative)
 
 Tested several architectural ideas from modded-nanogpt to see if they transfer to nanochat. All of these did not help:
