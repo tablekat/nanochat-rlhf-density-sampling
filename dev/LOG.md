@@ -4,6 +4,18 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-17: Modded-nanogpt Ideas Sweep (Continued)
+
+Continued testing ideas from modded-nanogpt.
+
+| Idea | Result | Notes |
+|------|--------|-------|
+| Attention gates | No improvement | Per-head learnable gates on attention output. +1GB memory, decreased efficiency. |
+| Batch size schedule | Abandoned | 8→16→24 with LR scaling. Made training script too bloated/complex, not worth cognitive overhead. |
+| Value embeddings | Helps a lot | Experiments still ongoing, more on this later. |
+
+---
+
 ## 2026-01-16: Flash Attention 3 Fallback to SDPA
 
 Added automatic fallback from Flash Attention 3 to PyTorch's `scaled_dot_product_attention` (SDPA) for users without Hopper GPUs. This enables nanochat to run on older CUDA GPUs, CPU, and MPS (Apple Silicon).
