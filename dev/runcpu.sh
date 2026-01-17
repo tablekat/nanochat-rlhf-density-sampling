@@ -1,12 +1,15 @@
 #!/bin/bash
 
 # Showing an example run for exercising some of the code paths on the CPU (or MPS on Macbooks)
+# This script was last updated/tuned on Jan 17, 2026.
+
 # Run as:
 # bash dev/cpu_demo_run.sh
 
 # NOTE: Training LLMs requires GPU compute and $$$. You will not get far on your Macbook.
 # Think of this run as educational/fun demo, not something you should expect to work well.
-# This is also why I hide this script away in dev/
+# (This is why I hide this script away in dev/)
+# You may also want to run this script manually and one by one, copy pasting commands into your terminal.
 
 # all the setup stuff
 export OMP_NUM_THREADS=1
@@ -20,58 +23,48 @@ if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=dummy
 fi
 
-# wipe the report
-python -m nanochat.report reset
-
-# train tokenizer on ~1B characters
-python -m nanochat.dataset -n 4
-python -m scripts.tok_train --max-chars=1000000000
+# train tokenizer on ~2B characters (~34 seconds on my MacBook Pro M3 Max)
+python -m nanochat.dataset -n 8
+python -m scripts.tok_train --max-chars=2000000000
 python -m scripts.tok_eval
 
-# train a very small 4 layer model on the CPU
-# each optimization step processes a single sequence of 1024 tokens
-# we only run 50 steps of optimization (bump this to get better results)
+# train a small 4 layer model
+# I tuned this run to complete in about 30 minutes on my MacBook Pro M3 Max.
+# To get better results, try increasing num_iterations, or get other ideas from your favorite LLM.
 python -m scripts.base_train \
-    --depth=4 \
-    --max-seq-len=1024 \
-    --device-batch-size=1 \
-    --total-batch-size=1024 \
-    --eval-every=50 \
-    --eval-tokens=4096 \
-    --core-metric-every=50 \
-    --core-metric-max-per-task=12 \
-    --sample-every=50 \
-    --num-iterations=50 \
+    --depth=6 \
+    --head-dim=64 \
+    --window-pattern=L \
+    --max-seq-len=512 \
+    --device-batch-size=32 \
+    --total-batch-size=16384 \
+    --eval-every=100 \
+    --eval-tokens=524288 \
+    --core-metric-every=-1 \
+    --sample-every=100 \
+    --num-iterations=5000 \
     --run=$WANDB_RUN
-python -m scripts.base_loss --device-batch-size=1 --split-tokens=4096
+python -m scripts.base_loss --device-batch-size=1 --split-tokens=16384
 python -m scripts.base_eval --max-per-task=16
 
-# midtraining
+# midtraining (~10 minutes on my MacBook Pro M3 Max)
+curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 python -m scripts.mid_train \
-    --max-seq-len=1024 \
-    --device-batch-size=1 \
-    --eval-every=50 \
-    --eval-tokens=4096 \
-    --total-batch-size=1024 \
-    --num-iterations=100 \
-    --run=$WANDB_RUN
-# eval results will be terrible, this is just to execute the code paths.
-# note that we lower the execution memory limit to 1MB to avoid warnings on smaller systems
-python -m scripts.chat_eval --source=mid --max-new-tokens=128 --max-problems=20
-
-# SFT
-python -m scripts.chat_sft \
-    --device-batch-size=1 \
-    --target-examples-per-step=4 \
-    --num-iterations=100 \
-    --eval-steps=4 \
-    --eval-metrics-max-problems=16 \
+    --max-seq-len=512 \
+    --device-batch-size=32 \
+    --total-batch-size=16384 \
+    --eval-every=200 \
+    --eval-tokens=524288 \
+    --num-iterations=1500 \
     --run=$WANDB_RUN
 
-# Chat CLI
-# python -m scripts.chat_cli -p "Why is the sky blue?"
+# (it's ~ok to skip SFT)
 
-# Chat Web
-# python -m scripts.chat_web
+# Chat with the model over CLI
+# The model should be able to say that it is Paris.
+# It might even know that the color of the sky is blue.
+# Sometimes the model likes it if you first say Hi before you ask it questions.
+# python -m scripts.chat_cli -i mid -p "What is the capital of France?"
 
-python -m nanochat.report generate
+# Chat with the model over a pretty WebUI ChatGPT style
+# python -m scripts.chat_web -i mid

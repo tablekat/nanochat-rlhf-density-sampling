@@ -96,6 +96,7 @@ def test_kv_cache_basic():
         head_dim=head_dim,
         num_layers=num_layers,
         device="cpu",
+        dtype=torch.float32,
     )
 
     # Check initial state
@@ -130,7 +131,7 @@ def test_kv_cache_prefill():
     # Create source cache and advance it
     src_cache = KVCache(
         batch_size=batch_size, num_heads=num_heads, seq_len=32,
-        head_dim=head_dim, num_layers=num_layers, device="cpu",
+        head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
     )
     # Write some data to source cache
     src_cache.k_cache[0, 0, :16, :, :] = 1.0
@@ -140,7 +141,7 @@ def test_kv_cache_prefill():
     # Create destination cache with larger seq_len
     dst_cache = KVCache(
         batch_size=batch_size, num_heads=num_heads, seq_len=64,
-        head_dim=head_dim, num_layers=num_layers, device="cpu",
+        head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
     )
 
     # Prefill
