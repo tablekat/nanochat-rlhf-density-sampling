@@ -4,6 +4,27 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-17: Various experiments
+
+Modded-nanogpt uses [Value Embeddings](https://arxiv.org/abs/2410.17897) (VEs) in a funny U-shaped structure, 3 of them in total and with gates. I tried a large number of tweaks on this today:
+
+- VEs at every layer, at alternating layers, U shaped, front and back. Alternating layers worked best, i.e. we end up with *a lot* more VEs than modded-nanogpt, at every other layer. It works better.
+- Many parameters sharing ideas to reduce new parameter count, nothing here worked. All failed.
+- Many ideas to reduce parameter count, the LLM hates all of them: low rank decompositions, projections. All failed.
+- Gated yes or no and how much. Gate helps.
+
+Long story short is that the models *love* Value Embeddings. It is a way to add a huge amount of capacity (parameters) to the model at almost zero cost of FLOPs, because these embeddings are simply added to the Values tensor. Any attempt to reduce the capacity of value embeddings (param sharing, low rank, projections) fail. The model wants many of them, and with all the capacity, and doing so wins across all x axes of steps, flops and wall clock. I re-ran the scaling laws and, because the models are now very parameter bloated, the optimal ratio has halved from 8 to 4! Way down lower than Chinchilla's 20 at this point.
+
+Other experiments, looking at val/bpb as a function of all of steps, flops and wall clock time:
+
+- Aspect ratio of 128 is worse than 64, I tried a sweep fixing FLOPs == 1e18 and 64 outperforms. The LLM prefers to be slightly thinner and longer.
+- Head dim definitely prefers to be 128 instead of 64, i.e. fewer bigger heads
+- Bunch of other random stuff like that.
+
+Keeping all of this work on a private branch for now but hope to push shortly.
+
+---
+
 ## 2026-01-17: Modded-nanogpt Ideas Sweep (Continued)
 
 Continued testing ideas from modded-nanogpt.
