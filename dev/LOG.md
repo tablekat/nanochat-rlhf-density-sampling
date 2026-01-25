@@ -4,6 +4,72 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-19 to 2026-01-22: Optimizer Hyperparameter Sweep
+
+Ran ~320 experiments across 6 rounds, scaling from d12→d16→d20 to find optimal optimizer hyperparameters. Added granular per-component control to `setup_optimizers()` — separate LRs and betas for embedding, unembedding, value_embeds, resid_lambdas, x0_lambdas, and Muon matrix params.
+
+### What We Swept
+- Learning rates for all 6 parameter groups
+- Beta1/beta2 for all 5 AdamW groups
+- Muon momentum (start/end), weight decay
+- Hundreds of combinations (2-way, 3-way, 4-way, etc.)
+
+### The Journey
+
+**At d12**, found two independent improvement routes:
+- **Route A:** emb_lr↑ (0.3→0.4), weight_decay↑ (0.1→0.15), matrix_lr↑ (0.02→0.025)
+- **Route B:** x0_lr↓ (0.5→0.2), x0_beta1↑ (0.8→0.9+)
+
+Both gave ~0.002 improvement, but combining them caused conflicts. Fine-tuning found wd=0.13, matrix_lr=0.027, emb_lr=0.38 helped slightly. Best d12 config: Route A + x0_beta1=0.95.
+
+**At d16**, Route B became competitive with Route A. The routes still conflicted when combined.
+
+**At d20** (target scale), everything changed:
+- Fine-tuned values from d12 **actively hurt** performance
+- Routes no longer conflicted
+- Just `x0_beta1=0.96` alone captured nearly all the gains
+
+### Final x0_beta1 Sweep at d20
+
+| x0_beta1 | val/bpb | Δ vs baseline |
+|----------|---------|---------------|
+| **0.96** | **0.7971** | **-0.0007** |
+| 0.94 | 0.7972 | -0.0006 |
+| 0.90 | 0.7972 | -0.0006 |
+| 0.97 | 0.7977 | -0.0001 |
+| 0.98 | 0.8011 | +0.0033 💀 |
+
+Flat plateau from 0.90-0.96, then sharp cliff at 0.97+.
+
+### Key Learnings
+
+1. **Hyperparameters are scale-dependent.** What works at d12 doesn't transfer to d20. The elaborate fine-tuning that won at d12 actively hurts at d20.
+
+2. **Improvement magnitude shrinks with scale.** ~0.002 at d12 → ~0.0007 at d20. The baseline is already better-tuned for larger models.
+
+3. **Sharp cliffs exist.** x0_beta1=0.98 is catastrophic while 0.96 is optimal.
+
+4. **Don't over-tune on small proxies.** Validate at target scale before shipping.
+
+### Final Recommendation
+
+For production d20 runs, add one flag:
+```
+--x0-lambdas-beta1=0.96
+```
+
+Skip everything else discovered at smaller scales.
+
+---
+
+## 2026-01-18: More various experiments
+
+- Tried Muon custom kernels for XXT and all the others. The improvement was there for targeted tests (~20%) but washed out completely to noise in an actual training run, especially because the Muon compute is split across all the workers. Abandoned due to complexity bloat.
+- Fuse Q,K,V,O nn.Linear layers into a single QKVO Linear layer. ~Zero impact
+- Tried the `sa_lambdas` that gate QKV and O. Slightly confused because of the use of rmsnorm, which erases the effect of any scalar multiplier. Helped a tiny bit (~1e-4 of loss), abandoned to control complexity.
+
+---
+
 ## 2026-01-17: Various experiments
 
 Modded-nanogpt uses [Value Embeddings](https://arxiv.org/abs/2410.17897) (VEs) in a funny U-shaped structure, 3 of them in total and with gates. I tried a large number of tweaks on this today:
