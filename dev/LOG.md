@@ -4,6 +4,27 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-29: Hyperball/MuonH Experiments (Negative Result)
+
+Explored Hyperball optimization from [this post](https://psychedelic-sunstone-851.notion.site/Fantastic-Pretraining-Optimizers-and-Where-to-Find-Them-2-1-Hyperball-Optimization-2e924306e6f280e7a5ffee00eb40a0dd) (saved to `knowledge/muonh.md`). Constrains weights to sphere of radius R (initial norm): `W_{t+1} = R · Normalize(W_t - η·R · Normalize(u_t))`. Had to change a number of details in a branch, e.g. not use zero init for our projections (or the initial norm would be zero), keep track of the initial norm, adjust Muon -> MuonH for the update.
+
+Experiments on d12:
+
+| Experiment | Result |
+|------------|--------|
+| MuonH for matrix params | Worse than baseline |
+| MuonH + LR sweep (2.5e-3 to 1e-2) | Still worse |
+| Added learnable RMSNorm scales (paper says γ preserves expressivity) | Still worse |
+| Various RMSNorm init tweaks, e.g. 0 at init to residual | Still worse |
+| AdamH for lm_head (paper recommends this) | Broken - loss plateaus (see below) |
+| AdamH + learnable output scales | Still worse |
+
+Could not outperform the baseline implementation. The article doesn't go into too much detail on how AdamH is applied to `lm_head` exactly. The classifier layer has to be able to increase in magnitude to make more confident predictions over time. Tried a sensible version with added 0-D learnable scalar, and also with RMSNorms with per-channel learnable scalars both pre and post resnet blocks.
+
+**Result:** This was not an out-of-the-box win for nanochat even with a mild attempt over a few hours at a bit of tuning and debugging. The idea itself is intuitively appealing. Might come back around later to try harder later.
+
+---
+
 ## 2026-01-28: Reverted Bigram Hash Embeddings
 
 Removed bigram embeddings (engram-lite) from the codebase. At larger scale (d25), the improvement was tiny and disappeared entirely when measured by wall clock time. It also bloated the VRAM used. The extra parameters and complexity aren't justified.
