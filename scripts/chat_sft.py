@@ -301,6 +301,7 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "window_pattern": model.config.window_pattern,
                 },
                 "user_config": user_config, # inputs to the training script
             }
