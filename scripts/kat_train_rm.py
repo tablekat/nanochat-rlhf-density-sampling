@@ -17,6 +17,7 @@ Design notes:
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json, math, time, hashlib
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -34,6 +35,7 @@ from nanochat.tokenizer import get_tokenizer
 from scripts.kat_utils import (
     ensure_prefix_dict,
     prefix_id_from_prefix,
+    prefix_from_example,
     render_prefix_for_completion,
 )
 
@@ -105,7 +107,7 @@ def build_pair_row(ex: Dict, density: Optional[Dict[str, float]]) -> Optional[Pa
     if not chosen or not rejected:
         return None
 
-    prefix = ensure_prefix_dict(ex.get("prefix"))
+    prefix = ensure_prefix_dict(prefix_from_example(ex))
     prefix_id = ex.get("prefix_id") or prefix_id_from_prefix(prefix)
     weight = 1.0
     if density is not None and prefix_id:
@@ -181,6 +183,8 @@ def make_batch(
 
     chosen_token_ids: List[List[int]] = []      # prompt + chosen completion + rating prompt
     rejected_token_ids: List[List[int]] = []    # prompt + rejected completion + rating prompt
+    chosen_last_indices: List[int] = []
+    rejected_last_indices: List[int] = []
     example_weights: List[float] = []
 
     rating_prompt_len = len(tokenizer.encode(likert_prompt))
@@ -206,6 +210,8 @@ def make_batch(
 
         chosen_token_ids.append(chosen_sequence)
         rejected_token_ids.append(rejected_sequence)
+        chosen_last_indices.append(len(chosen_sequence) - 1)
+        rejected_last_indices.append(len(rejected_sequence) - 1)
         example_weights.append(row.weight)
 
     def pad_sequences(seqs: List[List[int]]) -> torch.Tensor:
@@ -216,6 +222,8 @@ def make_batch(
     return (
         pad_sequences(chosen_token_ids),
         pad_sequences(rejected_token_ids),
+        torch.tensor(chosen_last_indices, dtype=torch.long, device=device),
+        torch.tensor(rejected_last_indices, dtype=torch.long, device=device),
         torch.tensor(example_weights, dtype=torch.float32, device=device),
     )
 
@@ -296,14 +304,15 @@ def evaluate_reward_model(
 
     with torch.no_grad():
         for rows in loader:
-            chosen_input_ids, rejected_input_ids, example_weights = make_batch(
+            chosen_input_ids, rejected_input_ids, chosen_last_indices, rejected_last_indices, example_weights = make_batch(
                 rows, tokenizer, max_len, min_prompt, device, pad_id
             )
             with autocast_ctx:
-                chosen_logits = backbone(chosen_input_ids)[:, -1, :]
-                rejected_logits = backbone(rejected_input_ids)[:, -1, :]
-                chosen_rewards = chosen_logits[:, label_token_id]
-                rejected_rewards = rejected_logits[:, label_token_id]
+                chosen_logits = backbone(chosen_input_ids)
+                rejected_logits = backbone(rejected_input_ids)
+                batch_idx = torch.arange(chosen_logits.size(0), device=device)
+                chosen_rewards = chosen_logits[batch_idx, chosen_last_indices, label_token_id]
+                rejected_rewards = rejected_logits[batch_idx, rejected_last_indices, label_token_id]
             reward_margins = chosen_rewards - rejected_rewards
             loss_vec = F.softplus(-reward_margins)
             loss = apply_weights(loss_vec, example_weights, weight_mode, weight_cap)
@@ -439,17 +448,17 @@ while step < max_steps:
         if step > max_steps:
             break
         
-        chosen_input_ids, rejected_input_ids, example_weights = make_batch(
+        chosen_input_ids, rejected_input_ids, chosen_last_indices, rejected_last_indices, example_weights = make_batch(
             _rows, tokenizer, max_len, min_prompt, device, pad_id
         )
         
         # Forward
         with autocast_ctx:
-            chosen_logits = backbone(chosen_input_ids)[:, -1, :]
-            rejected_logits = backbone(rejected_input_ids)[:, -1, :]
-
-            chosen_rewards = chosen_logits[:, label_token_id]
-            rejected_rewards = rejected_logits[:, label_token_id]
+            chosen_logits = backbone(chosen_input_ids)
+            rejected_logits = backbone(rejected_input_ids)
+            batch_idx = torch.arange(chosen_logits.size(0), device=device)
+            chosen_rewards = chosen_logits[batch_idx, chosen_last_indices, label_token_id]
+            rejected_rewards = rejected_logits[batch_idx, rejected_last_indices, label_token_id]
 
             reward_margins = chosen_rewards - rejected_rewards
             loss_vec = F.softplus(-reward_margins)

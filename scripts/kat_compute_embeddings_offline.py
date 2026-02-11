@@ -120,7 +120,7 @@ def compute_embeddings(items, base_model, tokenizer, device, batch_size=8):
             max_len = max(len(e) for e in encoded) if encoded else 1
             max_len = min(max_len, 512)  # Limit to 512 tokens
             
-            pad_token_id = tokenizer.encode_special("<|assistant_end|>")[0] if tokenizer.encode_special("<|assistant_end|>") else 0
+            pad_token_id = tokenizer.encode_special("<|assistant_end|>")
             
             input_ids = []
             for e in encoded:

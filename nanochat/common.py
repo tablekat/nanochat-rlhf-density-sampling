@@ -6,7 +6,10 @@ import os
 import re
 import logging
 import torch
-import torch.distributed as dist
+try:
+    import torch.distributed as dist
+except Exception:
+    dist = None
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
@@ -122,7 +125,7 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if ddp and device_type == "cuda":
+    if ddp and dist is not None and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device) # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
@@ -137,7 +140,7 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
-    if is_ddp():
+    if is_ddp() and dist is not None:
         dist.destroy_process_group()
 
 class DummyWandb:

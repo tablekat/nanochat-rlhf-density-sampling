@@ -42,7 +42,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, a
 from nanochat.checkpoint_manager import load_model
 from nanochat.tokenizer import get_tokenizer
 
-from scripts.kat_utils import ensure_prefix_dict, prefix_id_from_prefix, render_prefix_for_completion
+from scripts.kat_utils import ensure_prefix_dict, prefix_id_from_prefix, prefix_from_example, render_prefix_for_completion
 
 print_banner()
 
@@ -104,7 +104,7 @@ def build_pair_example(example: Dict, density: Optional[Dict[str, float]]) -> Op
     if not chosen or not rejected:
         return None
 
-    prefix = ensure_prefix_dict(example.get("prefix"))
+    prefix = ensure_prefix_dict(prefix_from_example(example))
     prefix_id = example.get("prefix_id") or prefix_id_from_prefix(prefix)
     weight = 1.0
     if density is not None and prefix_id:

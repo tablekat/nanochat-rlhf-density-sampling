@@ -4,7 +4,10 @@ Also a lot of borrowing of ideas from modded-nanogpt.
 """
 import torch
 from torch import Tensor
-import torch.distributed as dist
+try:
+    import torch.distributed as dist
+except Exception:
+    dist = None
 
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
@@ -106,6 +109,7 @@ class DistMuon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
                  nesterov: bool = True, ns_steps: int = 5):
+        assert dist is not None, "torch.distributed is not available in this PyTorch build"
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params = list(params)
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"

@@ -62,11 +62,14 @@ def main():
             
             # Validate and extract prefix object
             try:
-                if 'prefix' not in r:
-                    print(f"⚠️  Warning: Skipping entry without valid 'prefix' field on line {total_pairs}")
+                prefix_payload = r.get("prefix")
+                if prefix_payload is None:
+                    prefix_payload = r.get("prompt")
+                if prefix_payload is None:
+                    print(f"⚠️  Warning: Skipping entry without valid 'prefix' or 'prompt' field on line {total_pairs}")
                     continue
                 
-                prefix_obj = ensure_prefix_dict(r['prefix'])
+                prefix_obj = ensure_prefix_dict(prefix_payload)
                 
                 # Extract first user message as dedup key
                 first_user_msg = first_user_message(prefix_obj)

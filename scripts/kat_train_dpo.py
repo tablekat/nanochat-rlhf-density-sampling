@@ -16,7 +16,7 @@ from tqdm import tqdm
 from nanochat.model import Transformer
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
 
-from scripts.kat_utils import ensure_prefix_dict, render_prefix_for_completion
+from scripts.kat_utils import ensure_prefix_dict, prefix_from_example, render_prefix_for_completion
 
 class Pairset(Dataset):
     def __init__(self, path, tok, max_len=2048):
@@ -43,8 +43,7 @@ class Pairset(Dataset):
 
     def __getitem__(self, i):
         r = self.rows[i]
-        # NEW: Use prefix field instead of prompt
-        prefix = r.get("prefix", {"messages": []})
+        prefix = prefix_from_example(r)
         x_pos = self._pack(prefix, r["chosen"])
         x_neg = self._pack(prefix, r["rejected"])
         return torch.tensor(x_pos), torch.tensor(x_neg)

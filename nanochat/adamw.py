@@ -3,7 +3,10 @@ Borrowed from modded-nanogpt. By Keller, @vagrawal, et al.
 Not a general optimizer! But works for our specific use.
 """
 import torch
-import torch.distributed as dist
+try:
+    import torch.distributed as dist
+except Exception:
+    dist = None
 from torch import Tensor
 
 
@@ -13,6 +16,7 @@ class DistAdamW(torch.optim.Optimizer):
     In the style of ZeRO-2, i.e. sharded optimizer states and gradient reduction
     """
     def __init__(self, param_groups, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
+        assert dist is not None, "torch.distributed is not available in this PyTorch build"
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(param_groups, defaults)
 

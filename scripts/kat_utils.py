@@ -19,6 +19,7 @@ __all__ = [
     "first_user_message",
     "prefix_id_from_text",
     "prefix_id_from_prefix",
+    "prefix_from_example",
     "render_prefix_for_completion",
 ]
 
@@ -75,6 +76,17 @@ def prefix_id_from_prefix(prefix: Any) -> Optional[str]:
 
     prefix_dict = ensure_prefix_dict(prefix)
     return prefix_id_from_text(first_user_message(prefix_dict))
+
+
+def prefix_from_example(example: Any) -> Any:
+    """Extract prefix payload from an example dict (supports legacy 'prompt')."""
+
+    if isinstance(example, dict):
+        if example.get("prefix") is not None:
+            return example.get("prefix")
+        if example.get("prompt") is not None:
+            return example.get("prompt")
+    return None
 
 
 def render_prefix_for_completion(tokenizer, prefix: Any) -> List[int]:

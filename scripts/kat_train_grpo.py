@@ -32,7 +32,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, a
 from nanochat.checkpoint_manager import load_model
 from nanochat.tokenizer import get_tokenizer
 
-from scripts.kat_utils import render_prefix_for_completion
+from scripts.kat_utils import prefix_from_example, render_prefix_for_completion
 
 print_banner()
 
@@ -100,7 +100,7 @@ def md5_16(s: str) -> str:
 class PairRow:
     __slots__ = ("prefix", "chosen", "rejected")
     def __init__(self, d: dict):
-        self.prefix = d.get("prefix", {"messages": []})  # NEW: Full conversation object
+        self.prefix = prefix_from_example(d)
         self.chosen = d["chosen"]
         self.rejected = d["rejected"]
 
@@ -321,16 +321,31 @@ def sum_kl(policy, reference, x: torch.Tensor, labels: torch.Tensor) -> torch.Te
 
 # Resolve paths
 base = get_base_dir()
-mapping = {
-    "rm": os.path.join(base, "rm_checkpoints", "uniform", "d20_dual"),
-    "rm_density": os.path.join(base, "rm_checkpoints", "density", "d20_dual"),
-}
+
+# RM checkpoint paths - try d20_dual first (from kat_train_rm_dual), fallback to d20 (from kat_train_rm)
+def find_rm_checkpoint_dir(base_path, rm_source):
+    """Find RM checkpoint directory, preferring dual format."""
+    variant = "uniform" if rm_source == "rm" else "density"
+    
+    # Try d20_dual first (dual-response format)
+    dual_path = os.path.join(base_path, "rm_checkpoints", variant, "d20_dual")
+    if os.path.exists(dual_path) and glob.glob(os.path.join(dual_path, "model_*.pt")):
+        return dual_path
+    
+    # Fallback to d20 (single-response format)
+    single_path = os.path.join(base_path, "rm_checkpoints", variant, "d20")
+    if os.path.exists(single_path) and glob.glob(os.path.join(single_path, "model_*.pt")):
+        return single_path
+    
+    # Return dual path for error message (expected location)
+    return dual_path
+
 grpo_out_mapping = {
     "grpo": os.path.join(base, "grpo_checkpoints", "uniform", "d20"),
     "grpo_density": os.path.join(base, "grpo_checkpoints", "density", "d20"),
 }
 
-rm_ckpt_dir = mapping[rm_source]
+rm_ckpt_dir = find_rm_checkpoint_dir(base, rm_source)
 save_dir = grpo_out_mapping[grpo_source]
 
 if pairs_path is None:
@@ -348,15 +363,26 @@ for p in reference.parameters():
 print0(f"Loading reward model from {rm_ckpt_dir}...")
 rm_ckpt_files = glob.glob(os.path.join(rm_ckpt_dir, "model_*.pt"))
 if not rm_ckpt_files:
-    raise FileNotFoundError(f"No RM checkpoint found in {rm_ckpt_dir}")
+    raise FileNotFoundError(
+        f"No RM checkpoint found in {rm_ckpt_dir}\n"
+        f"Train the reward model first with:\n"
+        f"  python -m scripts.kat_train_rm_dual --rm_source={rm_source}\n"
+        f"Or: torchrun --nproc_per_node=N -m scripts.kat_train_rm_dual -- --rm_source={rm_source}"
+    )
 rm_head_path = max(rm_ckpt_files, key=lambda x: int(Path(x).stem.split("_")[1]))
 print0(f"Using RM checkpoint: {rm_head_path}")
 
 rm = torch.load(rm_head_path, map_location="cpu")
-# head = RewardHead(in_dim=rm["meta"]["features_dim"]).to(device) # Removed RewardHead
-# head.load_state_dict(rm["rm_head_state_dict"]) # Removed RewardHead
-# for p_ in head.parameters(): # Removed RewardHead
-#     p_.requires_grad_(False) # Removed RewardHead
+
+# Verify this is a dual-format RM checkpoint (from kat_train_rm_dual)
+rm_meta = rm.get("meta", {})
+if "rating_prompt" not in rm_meta:
+    raise ValueError(
+        f"RM checkpoint appears to be from kat_train_rm.py (single-response format).\n"
+        f"GRPO requires the dual-response format from kat_train_rm_dual.py.\n"
+        f"Train the correct RM with:\n"
+        f"  python -m scripts.kat_train_rm_dual --rm_source={rm_source}"
+    )
 
 # Build separate reward backbone (keeps policy/reference untouched)
 reward_backbone, _, _ = load_model(source="sft", device=device, phase="eval")
@@ -487,8 +513,8 @@ while step < max_steps:
             if not reference_tokens:
                 reference_tokens = tokenizer.encode(" ")
 
-            policy_text = tokenizer.decode(policy_tokens, skip_special_tokens=False)
-            reference_text = tokenizer.decode(reference_tokens, skip_special_tokens=False)
+            policy_text = tokenizer.decode(policy_tokens)
+            reference_text = tokenizer.decode(reference_tokens)
 
             generated_rows.append(PairRow({
                 "prefix": row.prefix,

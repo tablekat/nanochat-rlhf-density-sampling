@@ -23,8 +23,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from nanochat.checkpoint_manager import get_base_dir, load_model
-from scripts.kat_utils import ensure_prefix_dict, prefix_id_from_prefix, render_prefix_for_completion
+from nanochat.common import get_base_dir
+from nanochat.checkpoint_manager import load_model
+from scripts.kat_utils import ensure_prefix_dict, prefix_id_from_prefix, prefix_from_example, render_prefix_for_completion
 
 
 # -----------------------------------------------------------------------------
@@ -228,7 +229,7 @@ def load_pairs(
             except json.JSONDecodeError:
                 continue
 
-            prefix = ensure_prefix_dict(ex.get("prefix"))
+            prefix = ensure_prefix_dict(prefix_from_example(ex))
             chosen = ex.get("chosen")
             rejected = ex.get("rejected")
             src = ex.get("src", "unknown")
